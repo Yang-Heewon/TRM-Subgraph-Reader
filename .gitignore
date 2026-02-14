@@ -10,3 +10,6 @@ __pycache__/
 processed/
 ckpt/
 emb/
+data/webqsp/
+data/*_split.jsonl
+data/*_entity_text.txt

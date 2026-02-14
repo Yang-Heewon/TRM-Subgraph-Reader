@@ -1,5 +1,6 @@
 import json
 import os
+import hashlib
 from typing import List
 
 import numpy as np
@@ -42,9 +43,37 @@ def mean_pool(last_hidden_state, attention_mask):
     return s / d
 
 
+def _hash_vec(text: str, dim: int) -> np.ndarray:
+    toks = (text or "").strip().split()
+    if not toks:
+        toks = ["<empty>"]
+    v = np.zeros((dim,), dtype=np.float32)
+    for t in toks:
+        h = hashlib.sha1(t.encode("utf-8")).digest()
+        for i in range(0, len(h), 2):
+            slot = ((h[i] << 8) + h[i + 1]) % dim
+            sign = 1.0 if (h[i] & 1) else -1.0
+            v[slot] += sign
+    n = np.linalg.norm(v) + 1e-12
+    return v / n
+
+
+def encode_texts_local_hash(texts: List[str], dim: int = 256) -> np.ndarray:
+    if not texts:
+        return np.zeros((0, dim), dtype=np.float32)
+    return np.stack([_hash_vec(x, dim) for x in texts]).astype(np.float32)
+
+
 def encode_texts(model_name: str, texts: List[str], batch_size: int, max_length: int, device: str) -> np.ndarray:
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    mdl = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
+    if (model_name or "").strip().lower() in {"local-hash", "local-simple", "local"}:
+        return encode_texts_local_hash(texts)
+
+    try:
+        tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        mdl = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(device)
+    except Exception:
+        print(f"⚠️ failed to load embedding model '{model_name}', falling back to local-hash embeddings")
+        return encode_texts_local_hash(texts)
     mdl.eval()
 
     out = []

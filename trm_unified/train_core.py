@@ -12,9 +12,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
 from .data import build_adj_from_tuples, iter_json_records, load_kb_map, load_rel_map, read_jsonl_by_offset, build_line_offsets
+from .tokenization import load_tokenizer
 
 
 def l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -78,7 +78,7 @@ class PathDataset(Dataset):
 
 
 def make_collate(tokenizer_name, rel_npy, q_npy, max_neighbors, prune_keep, prune_rand, max_q_len, max_steps):
-    tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    tok = load_tokenizer(tokenizer_name)
     rel_mem = np.load(rel_npy, mmap_mode='r')
     q_mem = np.load(q_npy, mmap_mode='r') if q_npy and os.path.exists(q_npy) else None
 
@@ -220,6 +220,13 @@ def _parse_eval_example(ex: dict, kb2idx: Dict[str, int], rel2idx: Dict[str, int
         final_tuples.append((s_id, r_id, o_id))
 
     starts = []
+    # Prefer canonical CID starts when available.
+    for x in ex.get('entities_cid', []):
+        try:
+            starts.append(int(x))
+        except Exception:
+            pass
+
     if 'seed_entities' in ex:
         for se in ex.get('seed_entities', []):
             if isinstance(se, dict) and 'node_id' in se:
@@ -276,7 +283,7 @@ def evaluate_relation_beam(
     debug_n: int,
 ):
     model.eval()
-    tok = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    tok = load_tokenizer(tokenizer_name)
     rel_mem = np.load(rel_npy, mmap_mode='r')
     q_mem = np.load(q_npy, mmap_mode='r') if q_npy and os.path.exists(q_npy) else None
 
@@ -302,7 +309,8 @@ def evaluate_relation_beam(
             qi = ex_idx if ex_idx < q_mem.shape[0] else 0
             q_emb = np.asarray(q_mem[qi], dtype=np.float32)
 
-        q_toks = tok(ex.get('question', ''), return_tensors='pt', truncation=True, max_length=max_q_len).to(device)
+        q_toks = tok(ex.get('question', ''), return_tensors='pt', truncation=True, max_length=max_q_len)
+        q_toks = {k: v.to(device) for k, v in q_toks.items()}
 
         beams = []
         for s in starts:
@@ -415,7 +423,7 @@ def train(args):
 
     kb2idx = load_kb_map(args.entities_txt)
     rel2idx = load_rel_map(args.relations_txt)
-    tok = AutoTokenizer.from_pretrained(args.trm_tokenizer, trust_remote_code=True)
+    tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
 
@@ -514,6 +522,8 @@ def train(args):
             torch.save(save_obj.state_dict(), ckpt)
             print(f'Saved {ckpt}')
             if getattr(args, 'dev_json', ''):
+                # Dev evaluation uses the same endpoint traversal metric as test:
+                # start-entity -> predicted end-entity, measured by Hit@1/F1.
                 mh, mf, sk = evaluate_relation_beam(
                     model=save_obj,
                     carry_init_fn=carry_init_fn,
@@ -540,8 +550,9 @@ def train(args):
 
 
 def test(args):
-    # Full relation-path beam traversal evaluation (same multi-hop behavior as test-time search).
-    tok = AutoTokenizer.from_pretrained(args.trm_tokenizer, trust_remote_code=True)
+    # Full relation-path beam traversal evaluation:
+    # start-entity -> predicted end-entity, measured by Hit@1/F1.
+    tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
     kb2idx = load_kb_map(args.entities_txt)

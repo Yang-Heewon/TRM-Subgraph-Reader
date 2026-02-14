@@ -1,10 +1,86 @@
+import json
 import os
+import shutil
 
 from trm_unified.data import ensure_dir, preprocess_split
 
 
+def _materialize_file(src: str, dst: str, mode: str = "symlink"):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if os.path.lexists(dst):
+        os.remove(dst)
+    if mode == "copy":
+        shutil.copy2(src, dst)
+    else:
+        os.symlink(src, dst)
+
+
+def _build_entities_with_names(entities_txt: str, entity_names_json: str, output_txt: str):
+    with open(entity_names_json, "r", encoding="utf-8") as f:
+        name_map = json.load(f)
+    if not isinstance(name_map, dict):
+        raise ValueError("entity_names_json must be a JSON object: {entity_id: name}")
+
+    os.makedirs(os.path.dirname(output_txt), exist_ok=True)
+    written = 0
+    with open(entities_txt, "r", encoding="utf-8") as fin, open(output_txt, "w", encoding="utf-8") as fout:
+        for line in fin:
+            eid = line.strip().split("\t")[0]
+            if not eid:
+                continue
+            name = name_map.get(eid, eid)
+            fout.write(f"{eid}\t{name}\n")
+            written += 1
+    return {"output": output_txt, "written": written}
+
+
+def _custom_link_inputs(cfg):
+    train_src = cfg.get("custom_train_jsonl", "")
+    if not train_src:
+        return None
+
+    mode = cfg.get("custom_link_mode", "symlink")
+    processed_dir = cfg["processed_dir"]
+    train_dst = os.path.join(processed_dir, "train.jsonl")
+    dev_src = cfg.get("custom_dev_jsonl", "") or train_src
+    dev_dst = os.path.join(processed_dir, "dev.jsonl")
+
+    _materialize_file(train_src, train_dst, mode=mode)
+    _materialize_file(dev_src, dev_dst, mode=mode)
+
+    out = {
+        "train": {"mode": mode, "src": train_src, "dst": train_dst},
+        "dev": {"mode": mode, "src": dev_src, "dst": dev_dst},
+    }
+    test_src = cfg.get("custom_test_jsonl", "")
+    if test_src:
+        test_dst = os.path.join(processed_dir, "test.jsonl")
+        _materialize_file(test_src, test_dst, mode=mode)
+        out["test"] = {"mode": mode, "src": test_src, "dst": test_dst}
+    return out
+
+
 def run(cfg):
     ensure_dir(cfg['processed_dir'])
+
+    out = {}
+    if cfg.get("entity_names_json"):
+        merged_out = cfg.get("merged_entities_txt") or os.path.join(
+            cfg["workspace_root"], "data", f"{cfg['dataset']}_entity_text.txt"
+        )
+        meta = _build_entities_with_names(
+            entities_txt=cfg["entities_txt"],
+            entity_names_json=cfg["entity_names_json"],
+            output_txt=merged_out,
+        )
+        cfg["entities_txt"] = merged_out
+        out["entities_with_names"] = meta
+
+    custom = _custom_link_inputs(cfg)
+    if custom is not None:
+        out["linked_inputs"] = custom
+        print("✅ preprocess done:", out)
+        return out
 
     train_out = os.path.join(cfg['processed_dir'], 'train.jsonl')
     dev_out = os.path.join(cfg['processed_dir'], 'dev.jsonl')
@@ -28,7 +104,7 @@ def run(cfg):
         max_neighbors=int(cfg['mine_max_neighbors']),
     )
 
-    out = {'train': tr, 'dev': dv}
+    out.update({'train': tr, 'dev': dv})
     if cfg.get('test_in'):
         test_out = os.path.join(cfg['processed_dir'], 'test.jsonl')
         te = preprocess_split(
