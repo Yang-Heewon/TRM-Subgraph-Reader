@@ -20,7 +20,8 @@ pip install -r requirements.txt
 DATASET=webqsp bash scripts/setup_and_preprocess.sh
 ```
 - `DATASET=cwq` 또는 `DATASET=all` 가능
-- 기본 Google Drive 폴더 URL은 스크립트에 내장되어 있습니다.
+- 기본 Google Drive 파일 URL은 스크립트에 내장되어 있습니다.
+- `DATASET=all`일 때는 `CWQ -> WebQSP` 순서로 전처리합니다.
 
 4. 임베딩 생성
 ```bash
@@ -57,3 +58,23 @@ bash scripts/run_local_demo.sh
 - TRM 모듈은 저장소의 `TinyRecursiveModels/`(로컬 사용본)를 사용합니다.
 - 데이터 자동 설정 상세: `data/README.md`
 - 필요 시 `TRM_ROOT` 환경변수로 TRM 모듈 경로를 재지정할 수 있습니다.
+- 전처리 BFS 깊이/경로 수 제어 예시:
+```bash
+python -m trm_rag_style.run \
+  --dataset cwq \
+  --stage preprocess \
+  --override max_steps=6 max_paths=8 mine_max_neighbors=256
+```
+- CWQ 먼저, 이후 WebQSP를 같은 설정으로 전처리:
+```bash
+MAX_STEPS=6 MAX_PATHS=8 MINE_MAX_NEIGHBORS=256 bash scripts/preprocess_cwq_then_webqsp.sh
+```
+- 서브그래프 인덱스 매핑 점검(엔티티/릴레이션/이름):
+```bash
+python scripts/inspect_subgraph_mapping.py \
+  --input data/CWQ/train_split.jsonl \
+  --entities_txt data/CWQ/embeddings_output/CWQ/e5/entity_ids.txt \
+  --relations_txt data/CWQ/embeddings_output/CWQ/e5/relation_ids.txt \
+  --entity_names_json data/data/entities_names.json \
+  --index 0 --show_tuples 10
+```

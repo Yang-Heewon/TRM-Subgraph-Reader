@@ -482,6 +482,8 @@ def train(args):
         model.train()
         pbar = tqdm(loader, disable=not is_main, desc=f'Ep {ep}')
         tot_loss = 0.0
+        tot_correct = 0
+        tot_count = 0
         steps = 0
         for batch in pbar:
             input_ids = batch['input_ids'].to(device, non_blocking=True)
@@ -499,6 +501,11 @@ def train(args):
                 carry, out = model(carry, {'input_ids': input_ids, 'attention_mask': attn, 'puzzle_identifiers': p_ids, 'relation_identifiers': r_ids, 'candidate_mask': c_mask})
                 logits = out['scores'].masked_fill(~c_mask, -1e4)
                 lv = ce(logits, labels).masked_fill(~v_mask, 0.0)
+                valid = v_mask & (labels >= 0)
+                if valid.any():
+                    pred = torch.argmax(logits, dim=1)
+                    tot_correct += int((pred[valid] == labels[valid]).sum().item())
+                    tot_count += int(valid.sum().item())
                 sc = v_mask.sum().clamp(min=1)
                 bl += ((t + 1) / T) * (lv.sum() / sc)
             if not torch.isfinite(bl):
@@ -506,12 +513,16 @@ def train(args):
                     raise RuntimeError('non-finite loss in DDP')
                 continue
             bl.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             tot_loss += bl.item()
             steps += 1
             if is_main:
-                pbar.set_postfix_str(f'loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f}')
+                acc = 100.0 * (tot_correct / max(1, tot_count))
+                pbar.set_postfix_str(
+                    f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
+                    f'acc={acc:.2f}% grad={float(grad_norm):.2e}'
+                )
 
         if is_ddp:
             dist.barrier()

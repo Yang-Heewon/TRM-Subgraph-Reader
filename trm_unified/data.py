@@ -127,18 +127,53 @@ def read_jsonl_by_offset(jsonl_path: str, offsets: List[int], idx: int) -> dict:
     return json.loads(line.decode("utf-8"))
 
 
-def _normalize_cwq(ex: dict, max_steps: int) -> dict:
+def _normalize_cwq(
+    ex: dict,
+    kb2idx: Dict[str, int],
+    max_steps: int,
+    max_paths: int,
+    max_neighbors: int,
+) -> dict:
+    entities = [int(x) for x in ex.get('entities', []) if isinstance(x, int)]
+    answers = ex.get('answers', [])
+    answers_cid = [int(x) for x in ex.get('answers_cid', []) if isinstance(x, int)]
+    tuples = ex.get('subgraph', {}).get('tuples', [])
+    valid_paths = ex.get('valid_paths', [])
+
+    # Fallback for CWQ raws shaped like WebQSP: derive answers_cid/valid_paths.
+    if (not answers_cid) and isinstance(answers, list):
+        for a in answers:
+            kb_id = a.get('kb_id') if isinstance(a, dict) else None
+            if kb_id in kb2idx:
+                answers_cid.append(int(kb2idx[kb_id]))
+    if (not valid_paths) and tuples and entities and answers_cid:
+        valid_paths = mine_valid_paths(
+            tuples=tuples,
+            start_entities=entities,
+            goal_entities=answers_cid,
+            max_steps=max_steps,
+            max_paths=max_paths,
+            max_neighbors=max_neighbors,
+        )
+
+    relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
+
     out = {
         'orig_id': ex.get('orig_id', ex.get('id', '')),
         'question': ex.get('question', ''),
-        'entities': [int(x) for x in ex.get('entities', []) if isinstance(x, int)],
-        'answers_cid': [int(x) for x in ex.get('answers_cid', []) if isinstance(x, int)],
-        'answers': ex.get('answers', []),
-        'subgraph': ex.get('subgraph', {'tuples': []}),
-        'valid_paths': ex.get('valid_paths', []),
+        'entities': entities,
+        'answers_cid': answers_cid,
+        'answers': answers,
+        'subgraph': {'tuples': tuples},
+        'valid_paths': valid_paths,
+        'relation_paths': relation_paths,
     }
     if max_steps > 0 and out['valid_paths']:
         out['valid_paths'] = [p[:max_steps] for p in out['valid_paths']]
+        out['relation_paths'] = [
+            [int(step[1]) for step in p if isinstance(step, list) and len(step) == 3]
+            for p in out['valid_paths']
+        ]
     return out
 
 
@@ -161,6 +196,8 @@ def _normalize_webqsp(ex: dict, kb2idx: Dict[str, int], max_steps: int, max_path
         max_neighbors=max_neighbors,
     )
 
+    relation_paths = [[int(step[1]) for step in p if isinstance(step, list) and len(step) == 3] for p in valid_paths]
+
     return {
         'orig_id': ex.get('id', ''),
         'question': ex.get('question', ''),
@@ -169,6 +206,7 @@ def _normalize_webqsp(ex: dict, kb2idx: Dict[str, int], max_steps: int, max_path
         'answers': answers,
         'subgraph': {'tuples': tuples},
         'valid_paths': valid_paths,
+        'relation_paths': relation_paths,
     }
 
 
@@ -190,7 +228,7 @@ def preprocess_split(
         for ex in iter_json_records(input_path):
             total += 1
             if dataset == 'cwq':
-                obj = _normalize_cwq(ex, max_steps)
+                obj = _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors)
             elif dataset == 'webqsp':
                 obj = _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors)
             else:

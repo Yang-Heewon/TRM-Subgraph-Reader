@@ -12,8 +12,8 @@ bash scripts/download_data.sh
 
 echo "[step] preprocess"
 if [ "$DATASET" = "all" ]; then
-  python -m trm_rag_style.run --dataset webqsp --stage preprocess
   python -m trm_rag_style.run --dataset cwq --stage preprocess
+  python -m trm_rag_style.run --dataset webqsp --stage preprocess
 else
   python -m trm_rag_style.run --dataset "$DATASET" --stage preprocess
 fi

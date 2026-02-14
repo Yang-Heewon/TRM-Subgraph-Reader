@@ -8,10 +8,21 @@ TMP_DIR="$DATA_DIR/.downloads"
 
 mkdir -p "$DATA_DIR" "$TMP_DIR" "$DATA_DIR/webqsp" "$DATA_DIR/CWQ/embeddings_output/CWQ/e5"
 
-GDRIVE_FOLDER_URL="${GDRIVE_FOLDER_URL:-https://drive.google.com/drive/folders/1ifgVHQDnvFEunP9hmVYT07Y3rvcpIfQp?usp=sharing}"
+GDRIVE_FILE_URL="${GDRIVE_FILE_URL:-https://drive.google.com/file/d/13DduGb1C-O6udi744WxNVnOVDJ6122JG/view?usp=sharing}"
+GDRIVE_FOLDER_URL="${GDRIVE_FOLDER_URL:-}"
+GDRIVE_FILE_OUT="${GDRIVE_FILE_OUT:-$TMP_DIR/gdrive_bundle.zip}"
 SKIP_GDRIVE="${SKIP_GDRIVE:-0}"
+TARGET_DATASET="$(echo "${DATASET:-all}" | tr '[:upper:]' '[:lower:]')"
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+run_gdown() {
+  if have_cmd gdown; then
+    gdown "$@"
+  else
+    python -m gdown "$@"
+  fi
+}
 
 require_tool() {
   local t="$1"
@@ -55,7 +66,11 @@ copy_first_match() {
 
   local found=""
   for pat in "$@"; do
-    found="$(find "$DATA_DIR" "$TMP_DIR" -type f -iname "$pat" 2>/dev/null | head -n 1 || true)"
+    if [[ "$pat" == */* ]]; then
+      found="$(find "$DATA_DIR" "$TMP_DIR" -type f -ipath "$pat" 2>/dev/null | head -n 1 || true)"
+    else
+      found="$(find "$DATA_DIR" "$TMP_DIR" -type f -iname "$pat" 2>/dev/null | head -n 1 || true)"
+    fi
     if [ -n "$found" ]; then
       break
     fi
@@ -95,15 +110,26 @@ CWQ_ENTITY_IDS_URL="${CWQ_ENTITY_IDS_URL:-}"
 CWQ_RELATION_IDS_URL="${CWQ_RELATION_IDS_URL:-}"
 
 # 1) Google Drive folder download (default on)
-if [ "$SKIP_GDRIVE" != "1" ] && [ -n "$GDRIVE_FOLDER_URL" ]; then
-  if ! have_cmd gdown; then
+if [ "$SKIP_GDRIVE" != "1" ] && [ -n "$GDRIVE_FILE_URL$GDRIVE_FOLDER_URL" ]; then
+  if ! have_cmd gdown && ! python -m gdown --help >/dev/null 2>&1; then
     echo "[err] gdown not found. Install with: pip install gdown"
     exit 1
   fi
-  GDRIVE_DIR="$TMP_DIR/gdrive_folder"
-  mkdir -p "$GDRIVE_DIR"
-  echo "[dl] gdrive folder -> $GDRIVE_DIR"
-  gdown --folder --fuzzy "$GDRIVE_FOLDER_URL" -O "$GDRIVE_DIR"
+  if [ -n "$GDRIVE_FILE_URL" ]; then
+    if [ -f "$GDRIVE_FILE_OUT" ]; then
+      echo "[skip] exists: $GDRIVE_FILE_OUT"
+    else
+      echo "[dl] gdrive file -> $GDRIVE_FILE_OUT"
+      run_gdown --fuzzy "$GDRIVE_FILE_URL" -O "$GDRIVE_FILE_OUT"
+    fi
+    extract_if_archive "$GDRIVE_FILE_OUT" "$DATA_DIR" || true
+  fi
+  if [ -n "$GDRIVE_FOLDER_URL" ]; then
+    GDRIVE_DIR="$TMP_DIR/gdrive_folder"
+    mkdir -p "$GDRIVE_DIR"
+    echo "[dl] gdrive folder -> $GDRIVE_DIR"
+    run_gdown --folder --fuzzy "$GDRIVE_FOLDER_URL" -O "$GDRIVE_DIR"
+  fi
 fi
 
 # 2) Optional bundle download/extract via URL
@@ -130,27 +156,35 @@ fi
 [ -n "$CWQ_RELATION_IDS_URL" ] && download_file "$CWQ_RELATION_IDS_URL" "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt"
 
 # 4) Auto-map from downloaded folder content
-copy_first_match "$DATA_DIR/webqsp/train.json" "train.json" "*webqsp*train*.json"
-copy_first_match "$DATA_DIR/webqsp/dev.json" "dev.json" "*webqsp*dev*.json"
-copy_first_match "$DATA_DIR/webqsp/entities.txt" "entities.txt" "*webqsp*entities*.txt" "entity_ids.txt"
-copy_first_match "$DATA_DIR/webqsp/relations.txt" "relations.txt" "*webqsp*relations*.txt" "relation_ids.txt"
+if [ "$TARGET_DATASET" = "webqsp" ] || [ "$TARGET_DATASET" = "all" ]; then
+  copy_first_match "$DATA_DIR/webqsp/train.json" "*/webqsp/train.json" "*webqsp*train*.json"
+  copy_first_match "$DATA_DIR/webqsp/dev.json" "*/webqsp/dev.json" "*webqsp*dev*.json"
+  copy_first_match "$DATA_DIR/webqsp/entities.txt" "*/webqsp/entities.txt" "*webqsp*entities*.txt" "entity_ids.txt"
+  copy_first_match "$DATA_DIR/webqsp/relations.txt" "*/webqsp/relations.txt" "*webqsp*relations*.txt" "relation_ids.txt"
+fi
 
-copy_first_match "$DATA_DIR/CWQ/train_split.jsonl" "train_split.jsonl" "*cwq*train*.jsonl" "*cwq*train*.json"
-copy_first_match "$DATA_DIR/CWQ/dev_split.jsonl" "dev_split.jsonl" "*cwq*dev*.jsonl" "*cwq*dev*.json"
-copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" "entity_ids.txt" "*cwq*entity*ids*.txt"
-copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" "relation_ids.txt" "*cwq*relation*ids*.txt"
+if [ "$TARGET_DATASET" = "cwq" ] || [ "$TARGET_DATASET" = "all" ]; then
+  copy_first_match "$DATA_DIR/CWQ/train_split.jsonl" "*/CWQ/train_split.jsonl" "*/CWQ/train.jsonl" "*/CWQ/train.json" "*cwq*train*.jsonl" "*cwq*train*.json"
+  copy_first_match "$DATA_DIR/CWQ/dev_split.jsonl" "*/CWQ/dev_split.jsonl" "*/CWQ/dev.jsonl" "*/CWQ/dev.json" "*cwq*dev*.jsonl" "*cwq*dev*.json"
+  copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" "*/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" "*/CWQ/entity_ids.txt" "*/CWQ/entities.txt" "*cwq*entity*ids*.txt" "*cwq*entities*.txt"
+  copy_first_match "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" "*/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" "*/CWQ/relation_ids.txt" "*/CWQ/relations.txt" "*cwq*relation*ids*.txt" "*cwq*relations*.txt"
+fi
 
 # 5) Verification
 set +e
 status=0
-require_path "$DATA_DIR/webqsp/train.json" || status=1
-require_path "$DATA_DIR/webqsp/dev.json" || status=1
-require_path "$DATA_DIR/webqsp/entities.txt" || status=1
-require_path "$DATA_DIR/webqsp/relations.txt" || status=1
-require_path "$DATA_DIR/CWQ/train_split.jsonl" || status=1
-require_path "$DATA_DIR/CWQ/dev_split.jsonl" || status=1
-require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" || status=1
-require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" || status=1
+if [ "$TARGET_DATASET" = "webqsp" ] || [ "$TARGET_DATASET" = "all" ]; then
+  require_path "$DATA_DIR/webqsp/train.json" || status=1
+  require_path "$DATA_DIR/webqsp/dev.json" || status=1
+  require_path "$DATA_DIR/webqsp/entities.txt" || status=1
+  require_path "$DATA_DIR/webqsp/relations.txt" || status=1
+fi
+if [ "$TARGET_DATASET" = "cwq" ] || [ "$TARGET_DATASET" = "all" ]; then
+  require_path "$DATA_DIR/CWQ/train_split.jsonl" || status=1
+  require_path "$DATA_DIR/CWQ/dev_split.jsonl" || status=1
+  require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/entity_ids.txt" || status=1
+  require_path "$DATA_DIR/CWQ/embeddings_output/CWQ/e5/relation_ids.txt" || status=1
+fi
 set -e
 
 if [ "$status" -ne 0 ]; then
