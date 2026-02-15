@@ -18,7 +18,7 @@ if [ "$DATASET" = "all" ]; then
   MAX_STEPS="$MAX_STEPS" MAX_PATHS="$MAX_PATHS" MINE_MAX_NEIGHBORS="$MINE_MAX_NEIGHBORS" \
     bash scripts/preprocess_cwq_then_webqsp.sh
 else
-  python -m trm_rag_style.run \
+  python -m graph_pipeline.run \
     --dataset "$DATASET" \
     --stage preprocess \
     --override \

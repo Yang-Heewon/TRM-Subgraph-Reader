@@ -10,7 +10,7 @@ MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
 
 echo "[step] preprocess cwq first (BFS depth=$MAX_STEPS, max_paths=$MAX_PATHS)"
-python -m trm_rag_style.run \
+python -m graph_pipeline.run \
   --dataset cwq \
   --stage preprocess \
   --override \
@@ -19,7 +19,7 @@ python -m trm_rag_style.run \
     mine_max_neighbors="$MINE_MAX_NEIGHBORS"
 
 echo "[step] preprocess webqsp"
-python -m trm_rag_style.run \
+python -m graph_pipeline.run \
   --dataset webqsp \
   --stage preprocess \
   --override \

@@ -2,6 +2,11 @@
 
 TRM 기반 그래프 경로 추론 파이프라인입니다.
 
+용어 정리(이름을 이해하기 쉽게):
+- `graph_pipeline` (새 별칭): 기존 `trm_rag_style` 실행/오케스트레이션 레이어
+- `trm_unified`: 실제 전처리/임베딩/학습/평가 코어 엔진
+- 기존 경로(`trm_rag_style`)도 계속 사용 가능
+
 ## 처음부터 시작하기
 
 1. 저장소 클론
@@ -42,6 +47,11 @@ DATASET=webqsp MODEL_IMPL=trm_hier6 CKPT=/path/to/model_ep1.pt bash trm_rag_styl
 ## 한 줄 실행 예시
 ```bash
 python -m trm_rag_style.run --dataset webqsp --stage all --model_impl trm_hier6
+```
+
+같은 명령의 쉬운 이름 버전:
+```bash
+python -m graph_pipeline.run --dataset webqsp --stage all --model_impl trm_hier6
 ```
 
 ## Repo-Only 로컬 동작 확인(외부 모델 다운로드 없이)
