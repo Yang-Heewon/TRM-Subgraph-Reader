@@ -9,6 +9,7 @@ DATASET="${DATASET:-all}"
 MAX_STEPS="${MAX_STEPS:-4}"
 MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
+PREPROCESS_WORKERS="${PREPROCESS_WORKERS:-0}"
 
 echo "[step] download + map data"
 DATASET="$DATASET" bash scripts/download_data.sh
@@ -24,7 +25,8 @@ else
     --override \
       max_steps="$MAX_STEPS" \
       max_paths="$MAX_PATHS" \
-      mine_max_neighbors="$MINE_MAX_NEIGHBORS"
+      mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
+      preprocess_workers="$PREPROCESS_WORKERS"
 fi
 
 echo "[done] preprocess complete"

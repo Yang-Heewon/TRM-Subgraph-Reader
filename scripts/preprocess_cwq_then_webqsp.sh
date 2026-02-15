@@ -8,6 +8,7 @@ cd "$REPO_ROOT"
 MAX_STEPS="${MAX_STEPS:-4}"
 MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
+PREPROCESS_WORKERS="${PREPROCESS_WORKERS:-0}"
 
 echo "[step] preprocess cwq first (BFS depth=$MAX_STEPS, max_paths=$MAX_PATHS)"
 python -m graph_pipeline.run \
@@ -16,7 +17,8 @@ python -m graph_pipeline.run \
   --override \
     max_steps="$MAX_STEPS" \
     max_paths="$MAX_PATHS" \
-    mine_max_neighbors="$MINE_MAX_NEIGHBORS"
+    mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
+    preprocess_workers="$PREPROCESS_WORKERS"
 
 echo "[step] preprocess webqsp"
 python -m graph_pipeline.run \
@@ -25,6 +27,7 @@ python -m graph_pipeline.run \
   --override \
     max_steps="$MAX_STEPS" \
     max_paths="$MAX_PATHS" \
-    mine_max_neighbors="$MINE_MAX_NEIGHBORS"
+    mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
+    preprocess_workers="$PREPROCESS_WORKERS"
 
 echo "[done] cwq -> webqsp preprocess complete"

@@ -62,6 +62,9 @@ def _custom_link_inputs(cfg):
 
 def run(cfg):
     ensure_dir(cfg['processed_dir'])
+    pp_workers = int(cfg.get('preprocess_workers', 0))
+    if pp_workers <= 0:
+        pp_workers = max(1, (os.cpu_count() or 2) - 1)
 
     out = {}
     if cfg.get("entity_names_json"):
@@ -96,6 +99,8 @@ def run(cfg):
         max_neighbors=int(cfg['mine_max_neighbors']),
         mine_paths=True,
         require_valid_paths=True,
+        preprocess_workers=pp_workers,
+        progress_desc=f"{cfg['dataset']}:train",
     )
     # Dev/Test: keep endpoint-traversal tasks even when no mined path exists.
     # Evaluation uses start entities + subgraph to reach gold answer entities (Hit@1/F1).
@@ -109,6 +114,8 @@ def run(cfg):
         max_neighbors=int(cfg['mine_max_neighbors']),
         mine_paths=False,
         require_valid_paths=False,
+        preprocess_workers=pp_workers,
+        progress_desc=f"{cfg['dataset']}:dev",
     )
 
     out.update({'train': tr, 'dev': dv})
@@ -124,6 +131,8 @@ def run(cfg):
             max_neighbors=int(cfg['mine_max_neighbors']),
             mine_paths=False,
             require_valid_paths=False,
+            preprocess_workers=pp_workers,
+            progress_desc=f"{cfg['dataset']}:test",
         )
         out['test'] = te
 

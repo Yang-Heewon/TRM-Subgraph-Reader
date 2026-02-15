@@ -1,7 +1,13 @@
 import json
+import multiprocessing as mp
 import os
 from collections import defaultdict, deque
 from typing import Dict, Iterable, List, Tuple
+
+from tqdm import tqdm
+
+
+_PP_CFG = {}
 
 
 def iter_json_records(path: str) -> Iterable[dict]:
@@ -232,25 +238,99 @@ def preprocess_split(
     max_neighbors: int = 128,
     mine_paths: bool = True,
     require_valid_paths: bool = True,
+    preprocess_workers: int = 1,
+    progress_desc: str = "preprocess",
 ):
     dataset = dataset.lower()
     kb2idx = load_kb_map(entities_txt)
 
+    total_hint = _estimate_total_records(input_path)
     kept = 0
     total = 0
-    with open(output_path, 'w', encoding='utf-8') as w:
-        for ex in iter_json_records(input_path):
-            total += 1
-            if dataset == 'cwq':
-                obj = _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
-            elif dataset == 'webqsp':
-                obj = _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
-            else:
-                raise ValueError(f'Unsupported dataset: {dataset}')
+    workers = max(1, int(preprocess_workers))
 
-            if require_valid_paths and not obj['valid_paths']:
-                continue
-            w.write(json.dumps(obj, ensure_ascii=False) + '\n')
-            kept += 1
+    with open(output_path, 'w', encoding='utf-8') as w, tqdm(total=total_hint, desc=progress_desc, unit='ex') as pbar:
+        if workers == 1:
+            for ex in iter_json_records(input_path):
+                total += 1
+                obj = _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths)
+                if require_valid_paths and not obj['valid_paths']:
+                    pbar.update(1)
+                    continue
+                w.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                kept += 1
+                pbar.update(1)
+        else:
+            try:
+                with mp.Pool(
+                    processes=workers,
+                    initializer=_init_preprocess_worker,
+                    initargs=(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths),
+                ) as pool:
+                    for obj in pool.imap(_normalize_one_mp, iter_json_records(input_path), chunksize=32):
+                        total += 1
+                        if require_valid_paths and not obj['valid_paths']:
+                            pbar.update(1)
+                            continue
+                        w.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                        kept += 1
+                        pbar.update(1)
+            except (PermissionError, OSError) as e:
+                print(f"[warn] multiprocessing disabled ({e}); fallback to single worker.")
+                for ex in iter_json_records(input_path):
+                    total += 1
+                    obj = _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths)
+                    if require_valid_paths and not obj['valid_paths']:
+                        pbar.update(1)
+                        continue
+                    w.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                    kept += 1
+                    pbar.update(1)
 
     return {'total': total, 'kept': kept, 'output': output_path}
+
+
+def _normalize_one(ex, dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths):
+    if dataset == 'cwq':
+        return _normalize_cwq(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
+    if dataset == 'webqsp':
+        return _normalize_webqsp(ex, kb2idx, max_steps, max_paths, max_neighbors, mine_paths=mine_paths)
+    raise ValueError(f'Unsupported dataset: {dataset}')
+
+
+def _init_preprocess_worker(dataset, kb2idx, max_steps, max_paths, max_neighbors, mine_paths):
+    global _PP_CFG
+    _PP_CFG = {
+        'dataset': dataset,
+        'kb2idx': kb2idx,
+        'max_steps': max_steps,
+        'max_paths': max_paths,
+        'max_neighbors': max_neighbors,
+        'mine_paths': mine_paths,
+    }
+
+
+def _normalize_one_mp(ex):
+    return _normalize_one(
+        ex=ex,
+        dataset=_PP_CFG['dataset'],
+        kb2idx=_PP_CFG['kb2idx'],
+        max_steps=_PP_CFG['max_steps'],
+        max_paths=_PP_CFG['max_paths'],
+        max_neighbors=_PP_CFG['max_neighbors'],
+        mine_paths=_PP_CFG['mine_paths'],
+    )
+
+
+def _estimate_total_records(path: str):
+    with open(path, 'r', encoding='utf-8') as f:
+        first = f.read(1)
+        while first and first.isspace():
+            first = f.read(1)
+    if first == '[':
+        return None
+    n = 0
+    with open(path, 'rb') as f:
+        for _ in f:
+            n += 1
+    return n

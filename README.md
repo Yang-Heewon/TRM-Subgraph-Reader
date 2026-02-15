@@ -81,6 +81,10 @@ python -m trm_rag_style.run \
 ```bash
 MAX_STEPS=6 MAX_PATHS=8 MINE_MAX_NEIGHBORS=256 bash scripts/preprocess_cwq_then_webqsp.sh
 ```
+- CPU 사용률을 높이고 tqdm 진행률로 확인:
+```bash
+MAX_STEPS=4 PREPROCESS_WORKERS=24 bash scripts/setup_and_preprocess.sh
+```
 - 서브그래프 인덱스 매핑 점검(엔티티/릴레이션/이름):
 ```bash
 python scripts/inspect_subgraph_mapping.py \
