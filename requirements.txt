@@ -6,3 +6,4 @@ sentencepiece
 einops
 pydantic
 gdown
+wandb

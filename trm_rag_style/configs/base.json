@@ -26,6 +26,8 @@
   "start_topk": 5,
   "eval_limit": -1,
   "debug_eval_n": 5,
+  "eval_every_epochs": 1,
+  "eval_start_epoch": 1,
 
   "seq_len": 1024,
   "hidden_size": 512,
@@ -38,5 +40,10 @@
   "pos_encodings": "rope",
   "forward_dtype": "float32",
   "halt_max_steps": 16,
-  "halt_exploration_prob": 0.1
+  "halt_exploration_prob": 0.1,
+  "ddp_find_unused": false,
+  "wandb_project": "graph-traverse",
+  "wandb_entity": "",
+  "wandb_run_name": "",
+  "wandb_mode": "disabled"
 }

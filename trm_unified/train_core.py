@@ -17,6 +17,37 @@ from .data import build_adj_from_tuples, iter_json_records, load_kb_map, load_re
 from .tokenization import load_tokenizer
 
 
+def _setup_wandb(args, is_main: bool):
+    if not is_main:
+        return None
+    mode = str(getattr(args, "wandb_mode", "disabled") or "disabled").lower()
+    if mode in {"off", "false", "none", "disabled", "disable"}:
+        return None
+    try:
+        import wandb  # type: ignore
+    except Exception as e:
+        print(f"[warn] wandb import failed: {e}; continue without wandb logging")
+        return None
+
+    run = wandb.init(
+        project=getattr(args, "wandb_project", None) or "graph-traverse",
+        entity=getattr(args, "wandb_entity", None) or None,
+        name=getattr(args, "wandb_run_name", None) or None,
+        mode=mode,
+        config={
+            "dataset": os.path.basename(getattr(args, "train_json", "")),
+            "model_impl": getattr(args, "model_impl", ""),
+            "batch_size": int(getattr(args, "batch_size", 0)),
+            "epochs": int(getattr(args, "epochs", 0)),
+            "lr": float(getattr(args, "lr", 0.0)),
+            "max_steps": int(getattr(args, "max_steps", 0)),
+            "beam": int(getattr(args, "beam", 0)),
+            "start_topk": int(getattr(args, "start_topk", 0)),
+        },
+    )
+    return run
+
+
 def l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     n = np.linalg.norm(x, axis=-1, keepdims=True)
     return x / (n + eps)
@@ -262,6 +293,35 @@ def _parse_eval_example(ex: dict, kb2idx: Dict[str, int], rel2idx: Dict[str, int
     return final_tuples, starts, gold
 
 
+def _load_entity_labels(entities_txt: str) -> List[str]:
+    out = []
+    with open(entities_txt, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            eid = parts[0].strip() if parts else ""
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if name and name != eid:
+                out.append(f"{eid}:{name}")
+            else:
+                out.append(eid)
+    return out
+
+
+def _load_relation_labels(relations_txt: str) -> List[str]:
+    out = []
+    with open(relations_txt, "r", encoding="utf-8") as f:
+        for line in f:
+            out.append(line.strip())
+    return out
+
+
+def _idx_to_label(labels: List[str], idx: int) -> str:
+    i = int(idx)
+    if 0 <= i < len(labels):
+        return labels[i]
+    return str(i)
+
+
 @torch.no_grad()
 def evaluate_relation_beam(
     model,
@@ -281,6 +341,8 @@ def evaluate_relation_beam(
     max_q_len: int,
     eval_limit: int,
     debug_n: int,
+    entity_labels: Optional[List[str]] = None,
+    relation_labels: Optional[List[str]] = None,
 ):
     model.eval()
     tok = load_tokenizer(tokenizer_name)
@@ -410,6 +472,12 @@ def evaluate_relation_beam(
             print(f"[EvalQ] {ex.get('question', '')}")
             print(f"  relation_path: {rel_path}")
             print(f"  node_path: {node_path}")
+            if relation_labels:
+                rel_text_path = ' -> '.join(_idx_to_label(relation_labels, x) for x in best['rels'])
+                print(f"  relation_text_path: {rel_text_path}")
+            if entity_labels:
+                node_text_path = ' -> '.join(_idx_to_label(entity_labels, x) for x in best['nodes'])
+                print(f"  node_text_path: {node_text_path}")
             print(f"  pred_entity: {pred} | gold_n={len(gold)}")
 
     m_hit = float(np.mean(hit1)) if hit1 else 0.0
@@ -420,9 +488,12 @@ def evaluate_relation_beam(
 def train(args):
     is_ddp, rank, local_rank, world_size, device = _setup_ddp()
     is_main = rank == 0
+    wb = _setup_wandb(args, is_main)
 
     kb2idx = load_kb_map(args.entities_txt)
     rel2idx = load_rel_map(args.relations_txt)
+    entity_labels = _load_entity_labels(args.entities_txt)
+    relation_labels = _load_relation_labels(args.relations_txt)
     tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
@@ -461,7 +532,12 @@ def train(args):
 
     model.to(device)
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank] if torch.cuda.is_available() else None, output_device=local_rank if torch.cuda.is_available() else None, find_unused_parameters=True)
+        model = DDP(
+            model,
+            device_ids=[local_rank] if torch.cuda.is_available() else None,
+            output_device=local_rank if torch.cuda.is_available() else None,
+            find_unused_parameters=bool(getattr(args, 'ddp_find_unused', False)),
+        )
 
     def carry_init_fn(batch, dev):
         B = int(batch['input_ids'].shape[0])
@@ -523,6 +599,18 @@ def train(args):
                     f'[step {steps}] loss={bl.item():.4f} avg={tot_loss/max(1,steps):.4f} '
                     f'acc={acc:.2f}% grad={float(grad_norm):.2e}'
                 )
+                if wb is not None:
+                    wb.log(
+                        {
+                            "train/step_loss": float(bl.item()),
+                            "train/step_avg_loss": float(tot_loss / max(1, steps)),
+                            "train/step_acc": float(acc),
+                            "train/grad_norm": float(grad_norm),
+                            "train/epoch": int(ep),
+                            "train/step": int(steps),
+                        },
+                        step=(ep - 1) * max(1, len(loader)) + steps,
+                    )
 
         if is_ddp:
             dist.barrier()
@@ -532,7 +620,10 @@ def train(args):
             ckpt = os.path.join(args.out_dir, f'model_ep{ep}.pt')
             torch.save(save_obj.state_dict(), ckpt)
             print(f'Saved {ckpt}')
-            if getattr(args, 'dev_json', ''):
+            eval_every = max(1, int(getattr(args, 'eval_every_epochs', 1)))
+            eval_start = max(1, int(getattr(args, 'eval_start_epoch', 1)))
+            should_eval = ep >= eval_start and ((ep - eval_start) % eval_every == 0)
+            if getattr(args, 'dev_json', '') and should_eval:
                 # Dev evaluation uses the same endpoint traversal metric as test:
                 # start-entity -> predicted end-entity, measured by Hit@1/F1.
                 mh, mf, sk = evaluate_relation_beam(
@@ -553,11 +644,39 @@ def train(args):
                     max_q_len=args.max_q_len,
                     eval_limit=getattr(args, 'eval_limit', -1),
                     debug_n=getattr(args, 'debug_eval_n', 0),
+                    entity_labels=entity_labels,
+                    relation_labels=relation_labels,
                 )
                 print(f'[Dev] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')
+                if wb is not None:
+                    wb.log(
+                        {
+                            "dev/hit1": float(mh),
+                            "dev/f1": float(mf),
+                            "dev/skip": int(sk),
+                            "train/epoch": int(ep),
+                        },
+                        step=ep * max(1, len(loader)),
+                    )
+            elif getattr(args, 'dev_json', ''):
+                print(f'[Dev] skip eval at ep{ep} (start={eval_start}, every={eval_every})')
+            if wb is not None:
+                wb.log(
+                    {
+                        "train/epoch_avg_loss": float(tot_loss / max(1, steps)),
+                        "train/epoch_acc": float(100.0 * (tot_correct / max(1, tot_count))),
+                        "train/epoch": int(ep),
+                    },
+                    step=ep * max(1, len(loader)),
+                )
+        # Keep all ranks in sync while rank0 runs (potentially long) dev eval.
+        if is_ddp:
+            dist.barrier()
 
     if is_ddp:
         dist.destroy_process_group()
+    if wb is not None:
+        wb.finish()
 
 
 def test(args):
@@ -568,6 +687,8 @@ def test(args):
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
     kb2idx = load_kb_map(args.entities_txt)
     rel2idx = load_rel_map(args.relations_txt)
+    entity_labels = _load_entity_labels(args.entities_txt)
+    relation_labels = _load_relation_labels(args.relations_txt)
     cfg = {
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
@@ -626,5 +747,7 @@ def test(args):
             max_q_len=getattr(args, 'max_q_len', 512),
             eval_limit=getattr(args, 'eval_limit', -1),
             debug_n=getattr(args, 'debug_eval_n', 5),
+            entity_labels=entity_labels,
+            relation_labels=relation_labels,
         )
         print(f'[Test] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')

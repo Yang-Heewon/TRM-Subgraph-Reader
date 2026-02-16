@@ -31,6 +31,8 @@ def run(cfg):
         start_topk=int(cfg.get('start_topk', 5)),
         eval_limit=int(cfg.get('eval_limit', -1)),
         debug_eval_n=int(cfg.get('debug_eval_n', 0)),
+        eval_every_epochs=int(cfg.get('eval_every_epochs', 1)),
+        eval_start_epoch=int(cfg.get('eval_start_epoch', 1)),
         seq_len=int(cfg['seq_len']),
         hidden_size=int(cfg['hidden_size']),
         num_heads=int(cfg['num_heads']),
@@ -43,5 +45,10 @@ def run(cfg):
         forward_dtype=cfg['forward_dtype'],
         halt_max_steps=int(cfg['halt_max_steps']),
         halt_exploration_prob=float(cfg['halt_exploration_prob']),
+        ddp_find_unused=bool(cfg.get('ddp_find_unused', False)),
+        wandb_project=cfg.get('wandb_project', ''),
+        wandb_entity=cfg.get('wandb_entity', ''),
+        wandb_run_name=cfg.get('wandb_run_name', ''),
+        wandb_mode=cfg.get('wandb_mode', 'disabled'),
     )
     run_train(args)
