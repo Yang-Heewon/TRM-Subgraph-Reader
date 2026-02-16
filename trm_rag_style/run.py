@@ -71,10 +71,14 @@ def enrich_paths(cfg):
         legacy_processed = os.path.join(cfg['workspace_root'], 'trm_rag_style', 'processed', cfg['dataset'])
         if os.path.exists(legacy_processed):
             cfg['processed_dir'] = legacy_processed
-    if not had_emb_dir and not os.path.exists(cfg['emb_dir']):
-        legacy_emb = os.path.join(cfg['workspace_root'], 'trm_rag_style', 'emb', f"{cfg['dataset']}_{cfg['emb_tag']}")
-        if os.path.exists(legacy_emb):
-            cfg['emb_dir'] = legacy_emb
+    if not had_emb_dir:
+        # Prefer legacy emb dir when default dir exists but is empty/incomplete.
+        default_ent = os.path.join(cfg['emb_dir'], 'entity_embeddings.npy')
+        if not os.path.exists(default_ent):
+            legacy_emb = os.path.join(cfg['workspace_root'], 'trm_rag_style', 'emb', f"{cfg['dataset']}_{cfg['emb_tag']}")
+            legacy_ent = os.path.join(legacy_emb, 'entity_embeddings.npy')
+            if os.path.exists(legacy_ent):
+                cfg['emb_dir'] = legacy_emb
     if not had_ckpt_dir and not os.path.exists(cfg['ckpt_dir']):
         legacy_ckpt = os.path.join(cfg['workspace_root'], 'trm_rag_style', 'ckpt', f"{cfg['dataset']}_{cfg['model_impl']}")
         if os.path.exists(legacy_ckpt):

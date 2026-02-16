@@ -12,6 +12,7 @@
   "embed_batch_size": 64,
   "embed_max_length": 128,
   "embed_device": "cuda",
+  "embed_gpus": "",
 
   "batch_size": 8,
   "epochs": 5,

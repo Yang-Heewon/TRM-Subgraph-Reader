@@ -12,6 +12,7 @@ def run(cfg):
         batch_size=int(cfg['embed_batch_size']),
         max_length=int(cfg['embed_max_length']),
         device=cfg['embed_device'],
+        embed_gpus=cfg.get('embed_gpus', ''),
     )
     print('✅ embed done:', meta)
     return meta
