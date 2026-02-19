@@ -1,7 +1,7 @@
 import json
 import os
 import hashlib
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -29,12 +29,46 @@ def read_text_lines(path: str, mode: str) -> List[str]:
     return texts
 
 
-def collect_questions(jsonl_path: str) -> List[str]:
-    qs = []
+def load_id_list(path: str) -> List[str]:
+    ids = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            ids.append(line.split('\t')[0].strip())
+    return ids
+
+
+def load_entity_name_map(path: str) -> Dict[str, str]:
+    if not path or not os.path.exists(path):
+        return {}
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
+def process_relation_name(rel_id: str) -> str:
+    # GNN-RAG style: use the most specific relation token.
+    name = rel_id.split('.')[-1] if '.' in rel_id else rel_id
+    return name.replace('_', ' ')
+
+
+def collect_questions_and_ids(jsonl_path: str) -> Tuple[List[str], List[str]]:
+    qs: List[str] = []
+    qids: List[str] = []
     for ex in iter_json_records(jsonl_path):
-        q = ex.get('question', '')
-        qs.append(q if q else '')
-    return qs
+        q = (
+            ex.get('question')
+            or ex.get('Question')
+            or ex.get('query')
+            or ex.get('question_text')
+            or ''
+        )
+        qid = ex.get('orig_id', ex.get('id', ''))
+        qs.append(str(q).strip())
+        qids.append(str(qid))
+    return qs, qids
 
 
 def mean_pool(last_hidden_state, attention_mask):
@@ -72,10 +106,44 @@ def encode_texts(
     max_length: int,
     device: str,
     embed_gpus: str = "",
+    prefix: str = "",
+    backend: str = "auto",
     desc: str = "embed",
 ) -> np.ndarray:
+    if prefix and (not prefix.endswith(" ")):
+        prefix = prefix + " "
+    prepared = [f"{prefix}{str(t)}" for t in texts]
+
     if (model_name or "").strip().lower() in {"local-hash", "local-simple", "local"}:
-        return encode_texts_local_hash(texts, desc=f"{desc}(local-hash)")
+        return encode_texts_local_hash(prepared, desc=f"{desc}(local-hash)")
+
+    selected_backend = (backend or "auto").strip().lower()
+    if selected_backend in {"auto", "sentence_transformers", "sentence-transformers", "st"}:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            st_device = device
+            gpu_ids = _parse_gpu_ids(embed_gpus)
+            if torch.cuda.is_available() and gpu_ids:
+                st_device = f"cuda:{gpu_ids[0]}"
+
+            st_model = SentenceTransformer(model_name, device=st_device)
+            emb = st_model.encode(
+                prepared,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                normalize_embeddings=True,
+            )
+            return np.asarray(emb, dtype=np.float32)
+        except Exception as e:
+            # Fallback to transformers mean-pool path if sentence-transformers
+            # is unavailable or fails to load this model.
+            print(
+                "⚠️ sentence-transformers backend unavailable; "
+                f"falling back to transformers backend ({e})"
+            )
+
+    # Transformers mean-pool backend (legacy path)
 
     gpu_ids = _parse_gpu_ids(embed_gpus)
     run_device = device
@@ -95,8 +163,8 @@ def encode_texts(
     out = []
     total_batches = (len(texts) + batch_size - 1) // batch_size if batch_size > 0 else 0
     with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size), total=total_batches, desc=desc, unit='batch'):
-            chunk = texts[i:i + batch_size]
+        for i in tqdm(range(0, len(prepared), batch_size), total=total_batches, desc=desc, unit='batch'):
+            chunk = prepared[i:i + batch_size]
             t = tok(chunk, padding=True, truncation=True, max_length=max_length, return_tensors='pt')
             t = {k: v.to(run_device, non_blocking=True) for k, v in t.items()}
             out_obj = mdl(**t, return_dict=False)
@@ -118,26 +186,81 @@ def build_embeddings(
     max_length: int = 128,
     device: str = 'cuda',
     embed_gpus: str = "",
+    entity_names_json: str = "",
+    embed_style: str = "default",
+    query_prefix: str = "",
+    passage_prefix: str = "",
+    embed_backend: str = "auto",
+    save_lists: bool = True,
+    test_jsonl: str = "",
 ):
     os.makedirs(out_dir, exist_ok=True)
 
-    ent_texts = read_text_lines(entities_txt, mode='entity')
-    rel_texts = read_text_lines(relations_txt, mode='relation')
-    q_train = collect_questions(train_jsonl)
-    q_dev = collect_questions(dev_jsonl)
+    style = (embed_style or "default").strip().lower()
+    gnn_style = style in {"gnn_rag", "gnn-rag", "paperstyle", "legacy"}
 
-    ent = encode_texts(model_name, ent_texts, batch_size, max_length, device, embed_gpus=embed_gpus, desc='embed:entity')
-    rel = encode_texts(model_name, rel_texts, batch_size, max_length, device, embed_gpus=embed_gpus, desc='embed:relation')
-    qtr = encode_texts(model_name, q_train, batch_size, max_length, device, embed_gpus=embed_gpus, desc='embed:query_train')
-    qdv = encode_texts(model_name, q_dev, batch_size, max_length, device, embed_gpus=embed_gpus, desc='embed:query_dev')
+    if gnn_style:
+        ent_ids = load_id_list(entities_txt)
+        rel_ids = load_id_list(relations_txt)
+        name_map = load_entity_name_map(entity_names_json)
+        ent_texts = [name_map.get(eid, eid) for eid in ent_ids]
+        rel_texts = [process_relation_name(rid) for rid in rel_ids]
+        # E5 conventions.
+        if not query_prefix:
+            query_prefix = "query: "
+        if not passage_prefix:
+            passage_prefix = "passage: "
+        if (embed_backend or "auto").strip().lower() == "auto":
+            # Match GNN-RAG style as closely as possible.
+            embed_backend = "sentence_transformers"
+    else:
+        ent_texts = read_text_lines(entities_txt, mode='entity')
+        rel_texts = read_text_lines(relations_txt, mode='relation')
+        ent_ids = load_id_list(entities_txt)
+        rel_ids = load_id_list(relations_txt)
+
+    q_train, q_train_ids = collect_questions_and_ids(train_jsonl)
+    q_dev, q_dev_ids = collect_questions_and_ids(dev_jsonl)
+
+    ent = encode_texts(
+        model_name, ent_texts, batch_size, max_length, device,
+        embed_gpus=embed_gpus, prefix=passage_prefix, backend=embed_backend, desc='embed:entity'
+    )
+    rel = encode_texts(
+        model_name, rel_texts, batch_size, max_length, device,
+        embed_gpus=embed_gpus, prefix=passage_prefix, backend=embed_backend, desc='embed:relation'
+    )
+    qtr = encode_texts(
+        model_name, q_train, batch_size, max_length, device,
+        embed_gpus=embed_gpus, prefix=query_prefix, backend=embed_backend, desc='embed:query_train'
+    )
+    qdv = encode_texts(
+        model_name, q_dev, batch_size, max_length, device,
+        embed_gpus=embed_gpus, prefix=query_prefix, backend=embed_backend, desc='embed:query_dev'
+    )
 
     np.save(os.path.join(out_dir, 'entity_embeddings.npy'), ent)
     np.save(os.path.join(out_dir, 'relation_embeddings.npy'), rel)
     np.save(os.path.join(out_dir, 'query_train.npy'), qtr)
     np.save(os.path.join(out_dir, 'query_dev.npy'), qdv)
 
+    if test_jsonl and os.path.exists(test_jsonl):
+        q_test, q_test_ids = collect_questions_and_ids(test_jsonl)
+        qte = encode_texts(
+            model_name, q_test, batch_size, max_length, device,
+            embed_gpus=embed_gpus, prefix=query_prefix, backend=embed_backend, desc='embed:query_test'
+        )
+        np.save(os.path.join(out_dir, 'query_test.npy'), qte)
+        if save_lists:
+            _save_lines(os.path.join(out_dir, 'query_test.txt'), q_test)
+            _save_lines(os.path.join(out_dir, 'query_test_ids.txt'), q_test_ids)
+
     meta = {
         'model_name': model_name,
+        'embed_style': style,
+        'embed_backend': embed_backend,
+        'query_prefix': query_prefix,
+        'passage_prefix': passage_prefix,
         'entity_shape': list(ent.shape),
         'relation_shape': list(rel.shape),
         'query_train_shape': list(qtr.shape),
@@ -145,6 +268,16 @@ def build_embeddings(
     }
     with open(os.path.join(out_dir, 'embedding_meta.json'), 'w', encoding='utf-8') as w:
         json.dump(meta, w, ensure_ascii=False, indent=2)
+    if save_lists:
+        _save_lines(os.path.join(out_dir, 'entity_ids.txt'), ent_ids)
+        _save_lines(os.path.join(out_dir, 'relation_ids.txt'), rel_ids)
+        _save_lines(os.path.join(out_dir, 'entity_names_used.txt'), ent_texts)
+        _save_lines(os.path.join(out_dir, 'relation_names_used.txt'), rel_texts)
+        _save_lines(os.path.join(out_dir, 'query_train.txt'), q_train)
+        _save_lines(os.path.join(out_dir, 'query_dev.txt'), q_dev)
+        _save_lines(os.path.join(out_dir, 'query_train_ids.txt'), q_train_ids)
+        _save_lines(os.path.join(out_dir, 'query_dev_ids.txt'), q_dev_ids)
+
     return meta
 
 
@@ -159,3 +292,9 @@ def _parse_gpu_ids(embed_gpus: str) -> List[int]:
             continue
         out.append(int(tok))
     return out
+
+
+def _save_lines(path: str, items: List[str]) -> None:
+    with open(path, 'w', encoding='utf-8') as f:
+        for x in items:
+            f.write(f"{x}\n")

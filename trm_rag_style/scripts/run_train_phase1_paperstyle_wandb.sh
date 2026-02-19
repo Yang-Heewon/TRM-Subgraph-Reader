@@ -5,25 +5,31 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Paper-style phase1 preset:
+# Paper-style phase1 preset (legacy-like):
 # - Supervised relation CE as main objective
 # - No halt/endpoint auxiliary loss
-# - Eval close to legacy behavior (single top-1 endpoint)
+# - Legacy-friendly train/eval defaults
 
 export DATASET="${DATASET:-cwq}"
 export MODEL_IMPL="${MODEL_IMPL:-trm_hier6}"
-export EPOCHS="${EPOCHS:-30}"
-export BATCH_SIZE="${BATCH_SIZE:-6}"
-export LR="${LR:-1e-4}"
+export EPOCHS="${EPOCHS:-5}"
+export BATCH_SIZE="${BATCH_SIZE:-16}"
+export LR="${LR:-2e-4}"
 export MAX_STEPS="${MAX_STEPS:-4}"
+export BEAM="${BEAM:-10}"
+export START_TOPK="${START_TOPK:-5}"
 
 export EVAL_MAX_STEPS="${EVAL_MAX_STEPS:-4}"
-export EVAL_EVERY_EPOCHS="${EVAL_EVERY_EPOCHS:-2}"
-export EVAL_START_EPOCH="${EVAL_START_EPOCH:-2}"
+export EVAL_EVERY_EPOCHS="${EVAL_EVERY_EPOCHS:-1}"
+export EVAL_START_EPOCH="${EVAL_START_EPOCH:-1}"
 export EVAL_LIMIT="${EVAL_LIMIT:-200}"
-export EVAL_PRED_TOPK="${EVAL_PRED_TOPK:-1}"
+export EVAL_PRED_TOPK="${EVAL_PRED_TOPK:-10}"
 export EVAL_USE_HALT="${EVAL_USE_HALT:-false}"
 export EVAL_NO_CYCLE="${EVAL_NO_CYCLE:-false}"
+export EVAL_BEAM="${EVAL_BEAM:-10}"
+export EVAL_START_TOPK="${EVAL_START_TOPK:-5}"
+export TRAIN_STYLE="${TRAIN_STYLE:-gnn_rag}"
+export DDP_TIMEOUT_MINUTES="${DDP_TIMEOUT_MINUTES:-180}"
 
 # Objective alignment to legacy/paper-style phase1.
 export ENDPOINT_LOSS_MODE="${ENDPOINT_LOSS_MODE:-aux}"

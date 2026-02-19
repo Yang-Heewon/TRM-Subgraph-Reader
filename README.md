@@ -2,11 +2,20 @@
 
 TRM 기반 그래프 경로 추론 파이프라인입니다.
 
+## 현재 사용 경로(권장)
+
+실제로 유지/사용하는 실행 경로는 아래입니다.
+
+- `experiments/paperstyle_rl/*`: CWQ 논문작업 스타일 전처리/임베딩 + phase1 + RL phase2 + test 평가
+- `trm_rag_style/scripts/*`: 실제 학습/평가 실행 스크립트
+- `trm_unified/*`: 전처리/임베딩/학습/평가 코어
+- `trm_agent/*`: `python -m trm_agent.run` 엔트리
+
 용어 정리(이름을 이해하기 쉽게):
 - `trm_agent`: TRM-agent 실행/오케스트레이션 레이어(권장 이름)
 - `trm_agent_pipeline`: 전처리 중심 alias 엔트리포인트
 - `trm_unified`: 실제 전처리/임베딩/학습/평가 코어 엔진
-- 기존 경로(`trm_rag_style`, `graph_pipeline`)도 레거시 호환으로 유지
+- `trm_rag_style`: 학습/평가 쉘 엔트리 레이어
 
 ## 처음부터 시작하기
 
@@ -108,10 +117,10 @@ bash scripts/run_cwq_experiment_suite.sh
 ```
 
 ## 전용 프리셋 폴더
-`논문작업` 스타일 재현 후 RL phase2를 이어서 돌리는 전용 실행 폴더:
+`논문작업` 스타일 재현 후 RL phase2를 이어서 돌리는 전용 실행 폴더(권장):
 ```bash
 cd /data2/workspace/heewon/GRAPH-TRAVERSE
-bash experiments/paperstyle_rl/run_all.sh
+bash experiments/paperstyle_rl/run_all_wandb.sh
 ```
 
 ## 한 줄 실행 예시

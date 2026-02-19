@@ -8,11 +8,18 @@ def run(cfg):
         relations_txt=cfg['relations_txt'],
         train_jsonl=cfg['train_jsonl'],
         dev_jsonl=cfg['dev_jsonl'],
+        test_jsonl=cfg.get('test_jsonl', ''),
         out_dir=cfg['emb_dir'],
         batch_size=int(cfg['embed_batch_size']),
         max_length=int(cfg['embed_max_length']),
         device=cfg['embed_device'],
         embed_gpus=cfg.get('embed_gpus', ''),
+        entity_names_json=cfg.get('entity_names_json', ''),
+        embed_style=cfg.get('embed_style', 'default'),
+        embed_backend=cfg.get('embed_backend', 'auto'),
+        query_prefix=str(cfg.get('embed_query_prefix', '')),
+        passage_prefix=str(cfg.get('embed_passage_prefix', '')),
+        save_lists=bool(cfg.get('embed_save_lists', True)),
     )
     print('✅ embed done:', meta)
     return meta

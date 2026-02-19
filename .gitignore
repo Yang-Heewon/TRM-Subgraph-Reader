@@ -13,3 +13,7 @@ emb/
 data/webqsp/
 data/*_split.jsonl
 data/*_entity_text.txt
+wandb/
+data/.downloads/
+data/CWQ/
+data/data/

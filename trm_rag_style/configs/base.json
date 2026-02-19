@@ -16,6 +16,11 @@
   "embed_max_length": 128,
   "embed_device": "cuda",
   "embed_gpus": "",
+  "embed_style": "gnn_rag",
+  "embed_backend": "auto",
+  "embed_query_prefix": "query: ",
+  "embed_passage_prefix": "passage: ",
+  "embed_save_lists": true,
 
   "batch_size": 8,
   "epochs": 5,

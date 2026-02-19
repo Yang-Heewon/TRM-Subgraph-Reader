@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -1080,6 +1081,13 @@ def train(args):
 
     endpoint_main_modes = {'main', 'endpoint_main', 'endpoint-first', 'endpoint_first'}
     rl_scst_modes = {'rl_scst', 'scst', 'reinforce', 'policy_gradient'}
+    entity_dist_main_modes = {
+        'entity_dist_main',
+        'entity_main',
+        'answer_dist_main',
+        'dist_main',
+        'gnn_dist_main',
+    }
     metric_align_main_modes = {
         'metric_align_main',
         'metric_main',
@@ -1209,6 +1217,106 @@ def train(args):
                 taken += 1
             return logprob_sum, entropy_sum, int(cur), int(taken)
 
+    def _entity_dist_loss_from_steps(step_cache, tuples_list, starts_list, golds_list):
+        eps = 1e-12
+        losses = []
+        B = int(len(starts_list))
+        for i in range(B):
+            gold_set = set(int(x) for x in golds_list[i])
+            if not gold_set:
+                continue
+
+            raw_tuples = tuples_list[i]
+            edges_by_src = {}
+            nodes = set()
+            for s, r, o in raw_tuples:
+                try:
+                    ss = int(s)
+                    rr = int(r)
+                    oo = int(o)
+                except Exception:
+                    continue
+                edges_by_src.setdefault(ss, []).append((rr, oo))
+                nodes.add(ss)
+                nodes.add(oo)
+
+            start_node = int(starts_list[i])
+            nodes.add(start_node)
+            nodes.update(gold_set)
+            if not nodes:
+                continue
+
+            node_list = list(nodes)
+            node2idx = {n: j for j, n in enumerate(node_list)}
+            if start_node not in node2idx:
+                continue
+            N = len(node_list)
+            dtype = step_cache[0]['probs'].dtype
+            p = torch.zeros((N,), device=device, dtype=dtype)
+            p[node2idx[start_node]] = 1.0
+
+            for st in step_cache:
+                if not bool(st['v_mask'][i].item()):
+                    break
+                rel_ids = st['r_ids'][i]
+                rel_mask = st['c_mask'][i]
+                rel_prob = st['probs'][i]
+
+                rel_prob_map = {}
+                valid_pos = torch.nonzero(rel_mask, as_tuple=False).squeeze(-1)
+                for pos in valid_pos.tolist():
+                    rr = int(rel_ids[pos].item())
+                    rel_prob_map[rr] = rel_prob_map.get(rr, 0.0) + rel_prob[pos]
+
+                p_next = torch.zeros_like(p)
+                for u_node, u_idx in node2idx.items():
+                    mass = p[u_idx]
+                    out_edges = edges_by_src.get(int(u_node), [])
+                    if not out_edges:
+                        p_next[u_idx] = p_next[u_idx] + mass
+                        continue
+
+                    rel_to_targets = {}
+                    for rr, vv in out_edges:
+                        rel_to_targets.setdefault(int(rr), []).append(int(vv))
+
+                    prob_used = torch.zeros((), device=device, dtype=dtype)
+                    for rr, targets in rel_to_targets.items():
+                        pr = rel_prob_map.get(rr, None)
+                        if pr is None:
+                            continue
+                        prob_used = prob_used + pr
+                        share = mass * pr / float(max(1, len(targets)))
+                        for vv in targets:
+                            if vv in node2idx:
+                                p_next[node2idx[vv]] = p_next[node2idx[vv]] + share
+
+                    # Keep residual mass to avoid collapsing when sampled relations
+                    # are unavailable from this source node.
+                    p_next[u_idx] = p_next[u_idx] + mass * torch.clamp(1.0 - prob_used, min=0.0)
+
+                z = p_next.sum()
+                if float(z.detach().item()) > 0.0:
+                    p = p_next / (z + eps)
+                else:
+                    p = p_next
+
+            gold = torch.zeros((N,), device=device, dtype=dtype)
+            hit_gold = 0
+            for g in gold_set:
+                if g in node2idx:
+                    gold[node2idx[g]] = 1.0
+                    hit_gold += 1
+            if hit_gold <= 0:
+                continue
+            gold = gold / gold.sum().clamp(min=1.0)
+            loss_i = F.kl_div(torch.log(p.clamp(min=eps)), gold, reduction='sum')
+            losses.append(loss_i)
+
+        if losses:
+            return torch.stack(losses).mean()
+        return torch.zeros((), device=device)
+
     for ep in range(1, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(ep)
@@ -1231,6 +1339,7 @@ def train(args):
             if phase2_halt_aux_weight is not None:
                 cur_halt_aux_weight = phase2_halt_aux_weight
         cur_endpoint_main_mode = cur_endpoint_loss_mode in endpoint_main_modes
+        cur_entity_dist_main_mode = cur_endpoint_loss_mode in entity_dist_main_modes
         cur_metric_align_main_mode = cur_endpoint_loss_mode in metric_align_main_modes
         cur_endpoint_enabled = cur_endpoint_main_mode or (cur_endpoint_aux_weight > 0.0)
         cur_metric_align_enabled = cur_metric_align_main_mode or (cur_metric_align_aux_weight > 0.0)
@@ -1326,6 +1435,7 @@ def train(args):
             else:
                 carry = carry_init_fn({'input_ids': input_ids}, device)
                 T = len(batch['seq_batches'])
+                entity_step_cache = []
                 for t, step in enumerate(batch['seq_batches']):
                     p_ids = step['puzzle_identifiers'].to(device)
                     r_ids = step['relation_identifiers'].to(device)
@@ -1338,6 +1448,16 @@ def train(args):
                     v_mask = step['valid_mask'].to(device)
                     carry, out = model(carry, {'input_ids': input_ids, 'attention_mask': attn, 'puzzle_identifiers': p_ids, 'relation_identifiers': r_ids, 'candidate_mask': c_mask})
                     logits = out['scores'].masked_fill(~c_mask, -1e4)
+                    if cur_entity_dist_main_mode:
+                        probs = torch.softmax(logits, dim=1)
+                        entity_step_cache.append(
+                            {
+                                'probs': probs,
+                                'r_ids': r_ids,
+                                'c_mask': c_mask,
+                                'v_mask': v_mask,
+                            }
+                        )
                     lv = ce(logits, labels).masked_fill(~v_mask, 0.0)
                     valid = v_mask & (labels >= 0)
                     if valid.any():
@@ -1367,6 +1487,10 @@ def train(args):
                         step_loss = policy_loss
                         if cur_relation_aux_weight > 0.0:
                             step_loss = step_loss + cur_relation_aux_weight * ce_loss
+                    elif cur_entity_dist_main_mode:
+                        step_loss = torch.zeros((), device=device)
+                        if cur_relation_aux_weight > 0.0:
+                            step_loss = step_loss + cur_relation_aux_weight * ce_loss
                     elif cur_endpoint_main_mode:
                         step_loss = endpoint_loss
                         if cur_relation_aux_weight > 0.0:
@@ -1387,6 +1511,14 @@ def train(args):
                         halt_l = halt_vec.sum() / halt_m.sum().clamp(min=1).float()
                         step_loss = step_loss + cur_halt_aux_weight * halt_l
                     bl += ((t + 1) / T) * step_loss
+                if cur_entity_dist_main_mode:
+                    entity_dist_loss = _entity_dist_loss_from_steps(
+                        step_cache=entity_step_cache,
+                        tuples_list=batch['rl_tuples'],
+                        starts_list=batch['rl_start_nodes'],
+                        golds_list=batch['rl_gold_answers'],
+                    )
+                    bl = bl + entity_dist_loss
             if not torch.isfinite(bl):
                 if is_ddp:
                     raise RuntimeError('non-finite loss in DDP')
