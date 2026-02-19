@@ -8,7 +8,7 @@ source "$SCRIPT_DIR/lib/portable_env.sh"
 PYTHON_BIN="$(require_python_bin)"
 cd "$REPO_ROOT"
 
-DATASET="${DATASET:-all}"
+DATASET="${DATASET:-cwq}"
 MAX_STEPS="${MAX_STEPS:-4}"
 MAX_PATHS="${MAX_PATHS:-4}"
 MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
@@ -21,20 +21,20 @@ DATASET="$DATASET" bash scripts/download_data.sh
 
 echo "[step] preprocess"
 if [ "$DATASET" = "all" ]; then
-  MAX_STEPS="$MAX_STEPS" MAX_PATHS="$MAX_PATHS" MINE_MAX_NEIGHBORS="$MINE_MAX_NEIGHBORS" \
-  TRAIN_PATH_POLICY="$TRAIN_PATH_POLICY" TRAIN_SHORTEST_K="$TRAIN_SHORTEST_K" \
-    bash scripts/preprocess_cwq_then_webqsp.sh
-else
-  $PYTHON_BIN -m trm_agent_pipeline.run \
-    --dataset "$DATASET" \
-    --stage preprocess \
-    --override \
-      max_steps="$MAX_STEPS" \
-      max_paths="$MAX_PATHS" \
-      mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
-      preprocess_workers="$PREPROCESS_WORKERS" \
-      train_path_policy="$TRAIN_PATH_POLICY" \
-      train_shortest_k="$TRAIN_SHORTEST_K"
+  echo "[err] DATASET=all is no longer supported in this slim pipeline."
+  echo "      Run per dataset: DATASET=cwq or DATASET=webqsp"
+  exit 2
 fi
+
+$PYTHON_BIN -m trm_agent.run \
+  --dataset "$DATASET" \
+  --stage preprocess \
+  --override \
+    max_steps="$MAX_STEPS" \
+    max_paths="$MAX_PATHS" \
+    mine_max_neighbors="$MINE_MAX_NEIGHBORS" \
+    preprocess_workers="$PREPROCESS_WORKERS" \
+    train_path_policy="$TRAIN_PATH_POLICY" \
+    train_shortest_k="$TRAIN_SHORTEST_K"
 
 echo "[done] preprocess complete"
