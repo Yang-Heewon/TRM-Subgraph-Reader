@@ -8,7 +8,8 @@ cd "$REPO_ROOT"
 # Dataset/model
 export DATASET="${DATASET:-cwq}"
 export MODEL_IMPL="${MODEL_IMPL:-trm_hier6}"
-export EMB_MODEL="${EMB_MODEL:-intfloat/multilingual-e5-large}"
+# Match GNN-RAG gnn defaults.
+export EMB_MODEL="${EMB_MODEL:-sentence-transformers/all-MiniLM-L6-v2}"
 
 # Preprocess settings (paper-style supervision: keep all mined paths)
 export MAX_STEPS="${MAX_STEPS:-4}"
@@ -17,11 +18,11 @@ export MINE_MAX_NEIGHBORS="${MINE_MAX_NEIGHBORS:-128}"
 export TRAIN_PATH_POLICY="${TRAIN_PATH_POLICY:-all}"
 export TRAIN_SHORTEST_K="${TRAIN_SHORTEST_K:-1}"
 
-# Embedding settings (GNN-RAG style)
-export EMBED_STYLE="${EMBED_STYLE:-gnn_rag}"
+# Embedding settings (GNN-RAG gnn-compatible style)
+export EMBED_STYLE="${EMBED_STYLE:-gnn_rag_gnn_exact}"
 export EMBED_BACKEND="${EMBED_BACKEND:-sentence_transformers}"
-export EMBED_QUERY_PREFIX="${EMBED_QUERY_PREFIX:-query: }"
-export EMBED_PASSAGE_PREFIX="${EMBED_PASSAGE_PREFIX:-passage: }"
+export EMBED_QUERY_PREFIX="${EMBED_QUERY_PREFIX:-}"
+export EMBED_PASSAGE_PREFIX="${EMBED_PASSAGE_PREFIX:-}"
 export ENTITY_NAMES_JSON="${ENTITY_NAMES_JSON:-data/data/entities_names.json}"
 
 # Train settings (phase1/phase2 split defaults for 10~12GB GPUs)

@@ -54,6 +54,20 @@ def process_relation_name(rel_id: str) -> str:
     return name.replace('_', ' ')
 
 
+def process_relation_name_gnn_exact(rel_id: str) -> str:
+    # GNN-RAG gnn/dataset_load.py build_rel_words:
+    # words = fields[-2].split('_') + fields[-1].split('_')
+    rel = (rel_id or "").strip()
+    if not rel:
+        return "UNK"
+    fields = rel.split(".")
+    if len(fields) >= 2:
+        words = fields[-2].split("_") + fields[-1].split("_")
+        words = [w for w in words if w]
+        return " ".join(words) if words else "UNK"
+    return rel.replace("_", " ")
+
+
 def collect_questions_and_ids(jsonl_path: str) -> Tuple[List[str], List[str]]:
     qs: List[str] = []
     qids: List[str] = []
@@ -198,8 +212,29 @@ def build_embeddings(
 
     style = (embed_style or "default").strip().lower()
     gnn_style = style in {"gnn_rag", "gnn-rag", "paperstyle", "legacy"}
+    gnn_exact_style = style in {
+        "gnn_exact",
+        "gnn-rag-gnn",
+        "gnn_rag_gnn",
+        "gnn_rag_gnn_exact",
+        "gnn_gnn_exact",
+    }
 
-    if gnn_style:
+    if gnn_exact_style:
+        ent_ids = load_id_list(entities_txt)
+        rel_ids = load_id_list(relations_txt)
+        # GNN-RAG gnn path does not use query:/passage: prefixes and builds
+        # relation text from the last two dotted fields.
+        # Keep entity surface text minimal (ID itself) to avoid extra supervision.
+        ent_texts = list(ent_ids)
+        rel_texts = [process_relation_name_gnn_exact(rid) for rid in rel_ids]
+        if (embed_backend or "auto").strip().lower() == "auto":
+            embed_backend = "sentence_transformers"
+        if not query_prefix:
+            query_prefix = ""
+        if not passage_prefix:
+            passage_prefix = ""
+    elif gnn_style:
         ent_ids = load_id_list(entities_txt)
         rel_ids = load_id_list(relations_txt)
         name_map = load_entity_name_map(entity_names_json)
@@ -259,6 +294,7 @@ def build_embeddings(
         'model_name': model_name,
         'embed_style': style,
         'embed_backend': embed_backend,
+        'relation_text_mode': 'gnn_exact_last2' if gnn_exact_style else ('gnn_rag_last1' if gnn_style else 'default'),
         'query_prefix': query_prefix,
         'passage_prefix': passage_prefix,
         'entity_shape': list(ent.shape),

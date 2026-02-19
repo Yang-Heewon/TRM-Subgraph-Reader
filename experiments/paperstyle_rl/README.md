@@ -42,8 +42,11 @@ bash experiments/paperstyle_rl/04_eval_phase2_test.sh
 - `NPROC_PER_NODE` (phase1 default: `3`)
 - `NPROC_PER_NODE_PHASE2` (phase2 default: `1`, RL 안정성용)
 - `CKPT_DIR_PHASE1`, `CKPT_DIR_PHASE2`
-- `EMBED_STYLE` (default: `gnn_rag`)
-- `EMBED_BACKEND` (default: `sentence_transformers`, GNN-RAG 유사 임베딩 경로)
+- `EMBED_STYLE` (default: `gnn_rag_gnn_exact`)
+- `EMBED_BACKEND` (default: `sentence_transformers`)
+- `EMB_MODEL` (default: `sentence-transformers/all-MiniLM-L6-v2`)
+- `EMBED_STYLE` 기본값은 `gnn_rag_gnn_exact`이며,
+  relation 텍스트를 GNN-RAG `gnn`과 동일하게 `fields[-2] + fields[-1]` 규칙으로 만듭니다.
 - `TRAIN_STYLE` (default: `gnn_rag`, phase1을 relation CE 중심으로 고정)
 - `ENTITY_NAMES_JSON` (default: `data/data/entities_names.json`)
 - `RESULTS_DIR` (default: `experiments/paperstyle_rl/results`)
