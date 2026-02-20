@@ -410,7 +410,7 @@ def make_collate(
             seq_batches[t]['halt_targets'] = halt_targets
             seq_batches[t]['halt_mask'] = halt_mask
 
-        rl_q = np.stack([ctx[1] for ctx in sample_ctx], axis=0).astype(np.float32)
+        rl_q = np.stack([ctx['q_emb'] for ctx in sample_ctx], axis=0).astype(np.float32)
         rl_starts = []
         rl_gold = []
         rl_tuples = []
