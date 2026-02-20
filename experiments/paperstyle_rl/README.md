@@ -2,11 +2,10 @@
 
 This folder contains the active preset:
 
-1. `preprocess`
-2. `embed` (GNN-RAG exact style)
-3. `phase1` supervised train
-4. `phase2` RL fine-tune
-5. `test` evaluation
+1. `embed` (includes HF download + preprocess + embedding)
+2. `phase1` supervised train
+3. `phase2` RL fine-tune
+4. `test` evaluation
 
 ## Cross-Platform Entrypoint
 
@@ -36,18 +35,39 @@ experiments\paperstyle_rl\run_pipeline.cmd --stage all
 Run one stage only:
 
 ```bash
+python experiments/paperstyle_rl/run_pipeline.py --stage embed
 python experiments/paperstyle_rl/run_pipeline.py --stage phase1
+python experiments/paperstyle_rl/run_pipeline.py --stage phase2
+python experiments/paperstyle_rl/run_pipeline.py --stage test
 ```
 
 ## Linux Bash Wrappers
 
-The existing bash wrappers are still available (`00_*.sh`, `run_all.sh`, `run_all_wandb.sh`) and map to the same stages.
+Primary wrappers:
+
+- `01_embed.sh` (download + preprocess + embed)
+- `02_train_phase1.sh`
+- `03_train_phase2_rl.sh`
+- `04_eval_phase2_test.sh`
+- `run_all.sh`
+- `run_all_wandb.sh`
+
+`run_all.sh` sequence is:
+1. `01_embed.sh`
+2. `02_train_phase1.sh`
+3. `03_train_phase2_rl.sh`
+4. `04_eval_phase2_test.sh`
 
 ## Key Environment Variables
 
 Main variables:
 
 - `DATASET` (default: `cwq`)
+- `EMB_MODEL` (default: `sentence-transformers/all-MiniLM-L6-v2`)
+- `EMBED_STYLE` (default: `gnn_rag_gnn_exact`)
+- `EMBED_BACKEND` (default: `sentence_transformers`)
+- `DOWNLOAD_FIRST` (default: `1`, used by `trm_rag_style/scripts/run_embed.sh`)
+- `RUN_PREPROCESS` (default: `1`, used by `trm_rag_style/scripts/run_embed.sh`)
 - `EPOCHS_PHASE1` (default: `5`)
 - `EPOCHS_PHASE2` (default: `20`)
 - `BATCH_SIZE_PHASE1` (default: `6`)
@@ -55,9 +75,6 @@ Main variables:
 - `LR` (default: `2e-4`)
 - `NPROC_PER_NODE` (default: `3`)
 - `NPROC_PER_NODE_PHASE2` (default: `1`)
-- `EMBED_STYLE` (default: `gnn_rag_gnn_exact`)
-- `EMBED_BACKEND` (default: `sentence_transformers`)
-- `EMB_MODEL` (default: `sentence-transformers/all-MiniLM-L6-v2`)
 - `WANDB_MODE`, `WANDB_PROJECT`, `WANDB_ENTITY`
 - `CKPT_DIR_PHASE1`, `CKPT_DIR_PHASE2`, `RESULTS_DIR`
 
