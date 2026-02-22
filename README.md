@@ -11,46 +11,51 @@ The original TRM model operated sequentially, moving from node to node via Reinf
 
 ---
 
-## Main Entrypoints
+## 🚀 One-Command Full Pipeline
 
-- `trm_agent/run.py` (Main Python Pipeline)
-- `trm_rag_style/scripts/run_download.sh`
-- `trm_rag_style/scripts/run_embed.sh`
-- `experiments/paperstyle_rl/run_pipeline.py`
-
-## Download & Prep Data
-
-Full CWQ from HF:
+To run the complete process from generating data to training and testing in one go:
 ```bash
-python experiments/paperstyle_rl/run_pipeline.py --stage download
-# Or via script
+python -m trm_agent.run --dataset webqsp --model_impl trm_hier6 --stage all --override epochs=20 batch_size=8 lr=1e-4 eval_limit=-1 eval_batch_size=100
+```
+*Note: Run on a single line.*
+
+---
+
+## 🛠 Step-by-Step Usage
+
+### 1. Data Download
+Download the dataset locally (example: CWQ from HF):
+```bash
 bash scripts/download_cwq_hf.sh
 ```
 
-Embed Graph Data:
+### 2. Preprocessing
+Parse the dataset, create maps, and initialize subgraphs:
+```bash
+python -m trm_agent.run --dataset webqsp --stage preprocess
+```
+
+### 3. Embedding (Model Customizable)
+Vectorize your Nodes and Relations. You can swap out the embedding model according to your requirements:
 ```bash
 DATASET=webqsp \
 EMB_MODEL=intfloat/multilingual-e5-large \
 EMB_TAG=e5 \
 bash trm_rag_style/scripts/run_embed.sh
 ```
+Or directly from the entry point:
+```bash
+python -m trm_agent.run --dataset webqsp --stage embed --embedding_model intfloat/multilingual-e5-large
+```
 
-## Training the Subgraph Reader
-
-**Warning:** In Windows environments, executing distributed training using PyTorch's `torchrun` and `nccl` backends may crash due to missing `libuv`. We recommend executing the standalone Python command or modifying your DDP timeout settings to use `gloo`.
-
-To execute a full native training run on a single machine/GPU without `torchrun` crashes on Windows:
-
+### 4. Training the Subgraph Reader
+Execute a full native training run on a single machine without `torchrun` crashes on Windows:
 ```bash
 python -m trm_agent.run --dataset webqsp --model_impl trm_hier6 --stage train --override epochs=20 batch_size=8 lr=1e-4 eval_limit=-1 eval_batch_size=100
 ```
-- Set `eval_batch_size=100` to utilize the new rapid Subgraph batched forward pass logic.
-- Change `--stage train` to `--stage all` if you have yet to preprocess and embed your local dataset.
 
-## High-Speed Batched Evaluation
-
-If you have a trained checkpoint and want to test it against the complete Dev or Test split rapidly:
-
+### 5. High-Speed Batched Testing
+Verify the accuracy (Hit@1, F1) on the test split:
 ```bash
 python -m trm_agent.run \
   --dataset webqsp \
