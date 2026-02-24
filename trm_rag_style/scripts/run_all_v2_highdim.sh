@@ -26,11 +26,11 @@ PREPROCESS_WORKERS="$PREPROCESS_WORKERS" \
 EMBED_GPUS="$EMBED_GPUS" \
 bash trm_rag_style/scripts/run_embed.sh
 
-echo "[step 3/3] train(hit1boost) + auto-test"
+echo "[step 3/3] train(v2 highdim) + auto-test"
 DATASET="$DATASET" \
 EMB_MODEL="$EMB_MODEL" \
 EMB_TAG="$EMB_TAG" \
 EMB_DIR="$EMB_DIR" \
-bash trm_rag_style/scripts/run_train_subgraph_hit1boost.sh
+bash trm_rag_style/scripts/run_train_subgraph_v2_highdim.sh
 
-echo "[done] hit1boost full pipeline finished"
+echo "[done] v2 highdim full pipeline finished"
