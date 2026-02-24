@@ -3,6 +3,7 @@ import math
 import os
 import re
 import json
+import random
 from datetime import timedelta
 from collections import deque
 from typing import Dict, List, Optional
@@ -19,6 +20,22 @@ from tqdm import tqdm
 
 from .data import build_adj_from_tuples, iter_json_records, load_kb_map, load_rel_map, read_jsonl_by_offset, build_line_offsets
 from .tokenization import load_tokenizer
+
+
+def _set_global_seed(seed: int, deterministic: bool = False):
+    s = int(seed)
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
 
 
 def _setup_wandb(args, is_main: bool):
@@ -160,16 +177,39 @@ def _apply_query_residual_np(
     return _l2_normalize_np(out)
 
 
+def _infer_vocab_size_from_state_dict(sd: dict) -> Optional[int]:
+    if not isinstance(sd, dict):
+        return None
+    cand_keys = [
+        "inner.embed_tokens.embedding_weight",
+        "module.inner.embed_tokens.embedding_weight",
+        "inner.lm_head.weight",
+        "module.inner.lm_head.weight",
+    ]
+    for k in cand_keys:
+        v = sd.get(k, None)
+        if hasattr(v, "shape") and len(v.shape) >= 2:
+            try:
+                return int(v.shape[0])
+            except Exception:
+                continue
+    return None
+
+
 class PathDataset(Dataset):
-    def __init__(self, jsonl_path: str, max_steps: int):
+    def __init__(self, jsonl_path: str, max_steps: int, min_path_hops: int = 1):
         self.jsonl_path = jsonl_path
         self.max_steps = max_steps
+        self.min_path_hops = max(1, int(min_path_hops))
         self.offsets = build_line_offsets(jsonl_path, is_main=True)
         self.flat = []
         for i in tqdm(range(len(self.offsets)), desc='Flattening'):
             ex = read_jsonl_by_offset(self.jsonl_path, self.offsets, i)
             vps = ex.get('valid_paths', [])
-            for pidx in range(len(vps)):
+            for pidx, p in enumerate(vps):
+                if self.min_path_hops > 1:
+                    if (not isinstance(p, list)) or (len(p) < self.min_path_hops):
+                        continue
                 self.flat.append((i, pidx))
 
     def __len__(self):
@@ -233,123 +273,198 @@ def make_collate(
             "Rebuild query/relation embeddings with the same embedding model/style."
         )
 
+    def _can_reach_goal(adj, node: int, goals: set, rem_steps: int, memo: dict) -> bool:
+        key = (int(node), int(rem_steps))
+        if key in memo:
+            return memo[key]
+        n = int(node)
+        if n in goals:
+            memo[key] = True
+            return True
+        if rem_steps <= 0:
+            memo[key] = False
+            return False
+        for _, nxt in adj.get(n, []):
+            if _can_reach_goal(adj, int(nxt), goals, rem_steps - 1, memo):
+                memo[key] = True
+                return True
+        memo[key] = False
+        return False
+
+    def _shortest_dist_to_goals(adj, goals: set, max_dist: int):
+        rev = {}
+        for s, edges in adj.items():
+            ss = int(s)
+            for _, o in edges:
+                oo = int(o)
+                rev.setdefault(oo, []).append(ss)
+        dist = {}
+        q = deque()
+        for g in goals:
+            gg = int(g)
+            dist[gg] = 0
+            q.append(gg)
+        while q:
+            cur = q.popleft()
+            d = dist[cur]
+            if d >= max_dist:
+                continue
+            for prv in rev.get(cur, []):
+                if prv in dist:
+                    continue
+                dist[prv] = d + 1
+                q.append(prv)
+        return dist
+
     def _fn(batch):
         toks = tok([b['q_text'] for b in batch], padding=True, truncation=True, max_length=max_q_len, return_tensors='pt')
-        
-        B = len(batch)
-        max_nodes = 0
-        subgraphs = []
-        
-        for i, b in enumerate(batch):
+        sample_ctx = []
+        for b in batch:
             adj = build_adj_from_tuples(b['tuples'])
+            qi = int(b['ex_line'])
+            if qi < 0 or qi >= int(q_mem.shape[0]):
+                raise RuntimeError(
+                    f"query_train.npy index out of range: ex_line={qi}, "
+                    f"q_mem_rows={int(q_mem.shape[0])}. "
+                    "Rebuild embeddings from the same processed train.jsonl."
+                )
+            q_emb = np.asarray(q_mem[qi], dtype=np.float32)
             gold_set = set(int(x) for x in b.get('answers_cid', []))
-            
-            nodes = set()
-            for s, _, o in b['tuples']:
-                nodes.add(int(s))
-                nodes.add(int(o))
-            
-            nodes_list = list(nodes)
-            max_nodes_per_graph = 500
-            if len(nodes_list) > max_nodes_per_graph:
-                important = set()
-                important.update(gold_set.intersection(nodes_list))
-                starts = set()
-                segs = b.get('path_segments', [])
-                if segs: starts.add(int(segs[0]))
-                important.update(starts.intersection(nodes_list))
-                
-                import random
-                rem = max_nodes_per_graph - len(important)
-                other = [n for n in nodes_list if n not in important]
-                if rem > 0:
-                    important.update(random.sample(other, min(rem, len(other))))
-                nodes_list = list(important)
-                
-            N = len(nodes_list)
-            max_nodes = max(max_nodes, N)
-            
-            node2idx = {n: idx for idx, n in enumerate(nodes_list)}
-            am = torch.eye(N, dtype=torch.bool)
-            
-            for s, _, o in b['tuples']:
-                s, o = int(s), int(o)
-                if s in node2idx and o in node2idx:
-                    si = node2idx[s]
-                    oi = node2idx[o]
-                    am[si, oi] = True
-                    am[oi, si] = True
-                    
-            p_ids = [n if (entity_vocab_size is None or n < entity_vocab_size) else 0 for n in nodes_list]
-            r_ids = [0] * N
-            lbls = [1.0 if n in gold_set else 0.0 for n in nodes_list]
-            
-            subgraphs.append({
-                'p_ids': p_ids, 'r_ids': r_ids, 'am': am, 'labels': lbls, 'N': N
-            })
-            
-        pt = torch.zeros((B, max_nodes), dtype=torch.long)
-        rt = torch.zeros((B, max_nodes), dtype=torch.long)
-        cmask = torch.zeros((B, max_nodes), dtype=torch.bool)
-        labels = torch.zeros((B, max_nodes), dtype=torch.float32)
-        
-        q_len = toks['input_ids'].shape[1]
-        L = q_len + max_nodes
-        full_am = torch.ones((B, 1, L, L), dtype=torch.bool)
-        
-        for k in range(B):
-            sg = subgraphs[k]
-            N = sg['N']
-            # In TRM, puzzle (node) embeddings are concatenated BEFORE query tokens.
-            # Nodes are at indices [0 : max_nodes]
-            # Queries are at indices [max_nodes : L]
-            
-            # 1. Block all node-to-node first
-            full_am[k, 0, :max_nodes, :max_nodes] = False
-            
-            if N > 0:
-                pt[k, :N] = torch.tensor(sg['p_ids'], dtype=torch.long)
-                rt[k, :N] = torch.tensor(sg['r_ids'], dtype=torch.long)
-                cmask[k, :N] = True
-                labels[k, :N] = torch.tensor(sg['labels'], dtype=torch.float32)
-                
-                # Restore valid node-to-node attention using Adjacency Matrix
-                full_am[k, 0, :N, :N] = sg['am']
-                
-            # 2. Block padded nodes (indices N : max_nodes) entirely
-            if N < max_nodes:
-                full_am[k, 0, :, N:max_nodes] = False
-                full_am[k, 0, N:max_nodes, :] = False
-                
-            # 3. Block padded query tokens entirely
-            q_mask = toks['attention_mask'][k]
-            valid_q_len = int(q_mask.sum())
-            if valid_q_len < q_len:
-                full_am[k, 0, :, max_nodes + valid_q_len:] = False
-                full_am[k, 0, max_nodes + valid_q_len:, :] = False
+            dist_to_goal = _shortest_dist_to_goals(adj, gold_set, max_steps) if gold_set else {}
+            sample_ctx.append(
+                {
+                    'adj': adj,
+                    'q_emb_init': np.asarray(q_emb, dtype=np.float32).copy(),
+                    'q_emb': q_emb,
+                    'gold_set': gold_set,
+                    'reach_memo': {},
+                    'dist_to_goal': dist_to_goal,
+                }
+            )
 
-        seq_batches = [{
-            'puzzle_identifiers': pt,
-            'relation_identifiers': rt,
-            'candidate_mask': cmask,
-            'labels': labels,
-            'attention_mask': full_am,
-            'valid_mask': cmask,
-            'endpoint_targets': labels,
-            'policy_targets': torch.zeros_like(labels),
-            'halt_targets': torch.zeros_like(labels),
-            'halt_mask': torch.zeros_like(cmask),
-        }]
-        
-        rl_tuples = []
+        seq_batches = []
+        for t in range(max_steps):
+            puzs, rels, labels, cmask, vmask, endpoint_targets, policy_targets = [], [], [], [], [], [], []
+            for i, b in enumerate(batch):
+                segs = b['path_segments']
+                idx = t * 2
+                if idx + 2 >= len(segs):
+                    puzs.append([0]); rels.append([0]); labels.append(-100); cmask.append([False]); vmask.append(False); endpoint_targets.append([0.0]); policy_targets.append([0.0])
+                    continue
+                cur = int(segs[idx])
+                gold_r = int(segs[idx + 1])
+                ctx_i = sample_ctx[i]
+                adj = ctx_i['adj']
+                q_emb = ctx_i['q_emb']
+                gold_set = ctx_i['gold_set']
+                reach_memo = ctx_i['reach_memo']
+                dist_to_goal = ctx_i['dist_to_goal']
+                edges = adj.get(cur, [])
+                rel_to_nodes = _build_rel_to_nodes(edges)
+                rel_cands = _select_rel_candidates(
+                    rel_to_nodes=rel_to_nodes,
+                    q_emb=q_emb,
+                    rel_mem=rel_mem,
+                    max_relations=int(max_neighbors),
+                    prune_keep=int(prune_keep),
+                    prune_rand=int(prune_rand),
+                )
+                if gold_r not in rel_cands:
+                    rel_cands.append(gold_r)
+                np.random.shuffle(rel_cands)
+                cur_pid = int(cur)
+                if cur_pid < 0 or (entity_vocab_size is not None and cur_pid >= int(entity_vocab_size)):
+                    cur_pid = 0
+                puzs.append([cur_pid] * len(rel_cands))
+                rels.append(rel_cands)
+                labels.append(rel_cands.index(gold_r))
+                cmask.append([True] * len(rel_cands))
+                vmask.append(True)
+                cur_dist = dist_to_goal.get(int(cur), None)
+                remain = max_steps - t
+                pos_rels_policy = set()
+                if cur_dist is not None and cur_dist > 0 and cur_dist <= remain:
+                    for rr, next_nodes in rel_to_nodes.items():
+                        if any(dist_to_goal.get(int(nxt), None) == cur_dist - 1 for nxt in next_nodes):
+                            pos_rels_policy.add(rr)
+                pt_row = [1.0 if rr in pos_rels_policy else 0.0 for rr in rel_cands]
+                if sum(pt_row) <= 0.0:
+                    pt_row[rel_cands.index(gold_r)] = 1.0
+                policy_targets.append(pt_row)
+                if endpoint_aux:
+                    rem_steps = max(0, max_steps - (t + 1))
+                    pos_rels = set()
+                    if gold_set:
+                        for rr, next_nodes in rel_to_nodes.items():
+                            if rr in pos_rels:
+                                continue
+                            if any(_can_reach_goal(adj, int(nn), gold_set, rem_steps, reach_memo) for nn in next_nodes):
+                                pos_rels.add(rr)
+                    endpoint_targets.append([1.0 if rr in pos_rels else 0.0 for rr in rel_cands])
+                else:
+                    endpoint_targets.append([0.0] * len(rel_cands))
+                ctx_i['q_emb'] = _apply_query_residual_np(
+                    q_emb=q_emb,
+                    rel_id=gold_r,
+                    rel_mem=rel_mem,
+                    enabled=bool(query_residual_enabled),
+                    alpha=float(query_residual_alpha),
+                    mode=str(query_residual_mode),
+                )
+
+            cmax = max(len(x) for x in puzs)
+            B = len(batch)
+            pt = torch.zeros((B, cmax), dtype=torch.long)
+            rt = torch.zeros((B, cmax), dtype=torch.long)
+            mt = torch.zeros((B, cmax), dtype=torch.bool)
+            et = torch.zeros((B, cmax), dtype=torch.float32)
+            ptt = torch.zeros((B, cmax), dtype=torch.float32)
+            for k in range(B):
+                L = len(puzs[k])
+                pt[k, :L] = torch.tensor(puzs[k], dtype=torch.long)
+                rt[k, :L] = torch.tensor(rels[k], dtype=torch.long)
+                mt[k, :L] = torch.tensor(cmask[k], dtype=torch.bool)
+                et[k, :L] = torch.tensor(endpoint_targets[k], dtype=torch.float32)
+                ptt[k, :L] = torch.tensor(policy_targets[k], dtype=torch.float32)
+            seq_batches.append({
+                'puzzle_identifiers': pt,
+                'relation_identifiers': rt,
+                'candidate_mask': mt,
+                'endpoint_targets': et,
+                'policy_targets': ptt,
+                'labels': torch.tensor(labels, dtype=torch.long),
+                'valid_mask': torch.tensor(vmask, dtype=torch.bool),
+            })
+
+        # Halt supervision:
+        # - valid steps before the last hop: 0
+        # - last valid hop of each path: 1
+        # - padded steps: excluded from halt loss
+        for t in range(max_steps):
+            vm = seq_batches[t]['valid_mask']
+            if t + 1 < max_steps:
+                next_vm = seq_batches[t + 1]['valid_mask']
+            else:
+                next_vm = torch.zeros_like(vm)
+            halt_targets = (vm & (~next_vm)).to(torch.float32)
+            halt_mask = vm.clone()
+            seq_batches[t]['halt_targets'] = halt_targets
+            seq_batches[t]['halt_mask'] = halt_mask
+
+        # For RL/SCST rollouts, start from the original query embedding.
+        # Using teacher-forced residual-updated q_emb leaks gold-path information.
+        rl_q = np.stack(
+            [ctx.get('q_emb_init', ctx['q_emb']) for ctx in sample_ctx],
+            axis=0,
+        ).astype(np.float32)
         rl_starts = []
         rl_gold = []
+        rl_tuples = []
         for b in batch:
             segs = b.get('path_segments', [])
             rl_starts.append(int(segs[0]) if len(segs) > 0 else 0)
             rl_gold.append([int(x) for x in b.get('answers_cid', [])])
             rl_tuples.append(b.get('tuples', []))
-            
         return {
             'input_ids': toks['input_ids'],
             'attention_mask': toks['attention_mask'],
@@ -357,7 +472,7 @@ def make_collate(
             'rl_tuples': rl_tuples,
             'rl_start_nodes': rl_starts,
             'rl_gold_answers': rl_gold,
-            'rl_q_embs': torch.zeros((B, 1)),
+            'rl_q_embs': torch.tensor(rl_q, dtype=torch.float32),
         }
 
     return _fn
@@ -367,15 +482,8 @@ def _setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         timeout_min = int(os.environ.get("DDP_TIMEOUT_MINUTES", "30"))
         timeout_min = max(1, timeout_min)
-        
-        # Windows does not support NCCL out of the box
-        if os.name == 'nt':
-            backend = 'gloo'
-        else:
-            backend = 'nccl' if torch.cuda.is_available() else 'gloo'
-            
         dist.init_process_group(
-            backend=backend,
+            backend='nccl' if torch.cuda.is_available() else 'gloo',
             timeout=timedelta(minutes=timeout_min),
         )
         rank = int(os.environ['RANK'])
@@ -404,6 +512,23 @@ def build_model(model_impl: str, trm_root: str, cfg: dict):
     return cls(cfg), carry_cls
 
 
+def _clone_carry(carry):
+    inner = carry.inner_carry
+    inner_type = type(inner)
+    carry_type = type(carry)
+    inner_kwargs = {}
+    for k in inner.__dataclass_fields__.keys():
+        v = getattr(inner, k)
+        inner_kwargs[k] = v.clone()
+    current_data = {}
+    for k, v in carry.current_data.items():
+        current_data[k] = v.clone() if torch.is_tensor(v) else v
+    return carry_type(
+        inner_carry=inner_type(**inner_kwargs),
+        steps=carry.steps.clone(),
+        halted=carry.halted.clone(),
+        current_data=current_data,
+    )
 
 
 def _parse_eval_example(ex: dict, kb2idx: Dict[str, int], rel2idx: Dict[str, int]):
@@ -706,6 +831,9 @@ def evaluate_relation_beam(
     query_residual_mode: str = "sub_rel",
     entity_labels: Optional[List[str]] = None,
     relation_labels: Optional[List[str]] = None,
+    eval_dump_jsonl: str = "",
+    eval_random_sample_size: int = 0,
+    eval_random_seed: int = 42,
 ):
     model.eval()
     tok = load_tokenizer(tokenizer_name)
@@ -729,10 +857,22 @@ def evaluate_relation_beam(
         )
 
     data = list(iter_json_records(eval_json))
-    total = len(data) if eval_limit < 0 else min(len(data), eval_limit)
-    if total > int(q_mem.shape[0]):
+    n_data = int(len(data))
+    rand_n = int(max(0, int(eval_random_sample_size)))
+    if rand_n > 0:
+        k = min(n_data, rand_n)
+        rng = np.random.default_rng(int(eval_random_seed))
+        eval_indices = rng.choice(n_data, size=k, replace=False).astype(np.int64).tolist()
+    else:
+        total_seq = n_data if eval_limit < 0 else min(n_data, int(eval_limit))
+        eval_indices = list(range(total_seq))
+    total = int(len(eval_indices))
+    if total <= 0:
+        return 0.0, 0.0, 0
+    max_qi = int(max(eval_indices))
+    if max_qi >= int(q_mem.shape[0]):
         raise RuntimeError(
-            f"query embedding rows mismatch: eval_examples={total}, q_mem_rows={int(q_mem.shape[0])}, "
+            f"query embedding rows mismatch: max_eval_index={max_qi}, q_mem_rows={int(q_mem.shape[0])}, "
             f"eval_json={eval_json}, q_npy={q_npy}. "
             "Use query_dev.npy for dev eval and query_test.npy for test eval."
         )
@@ -742,6 +882,12 @@ def evaluate_relation_beam(
     debugged = 0
     pred_topk = max(1, int(eval_pred_topk))
     min_hops_before_stop = max(0, int(eval_min_hops_before_stop))
+    dump_fp = None
+    if eval_dump_jsonl:
+        dump_dir = os.path.dirname(str(eval_dump_jsonl))
+        if dump_dir:
+            os.makedirs(dump_dir, exist_ok=True)
+        dump_fp = open(eval_dump_jsonl, "w", encoding="utf-8")
 
     entity_vocab_size = None
     try:
@@ -773,170 +919,250 @@ def evaluate_relation_beam(
                 break
         return out
 
-    batch_size = int(getattr(args, 'eval_batch_size', 100)) if 'args' in globals() else 100 # Default to 100 but allow argument override if passed implicitly
-    
-    # We will buffer instances to run in batches
-    buffer = []
-    
-    def _flush_buffer():
-        if not buffer: return
-        B = len(buffer)
-        
-        # Determine maximum sequence lengths in this batch
-        max_q_len_batch = max(b['q_len'] for b in buffer)
-        max_nodes_batch = max(b['N'] for b in buffer)
-        
-        # Prepare batched tensors
-        input_ids = torch.zeros((B, max_q_len_batch), dtype=torch.long, device=device)
-        attn_mask = torch.zeros((B, max_q_len_batch), dtype=torch.long, device=device)
-        p_ids = torch.zeros((B, max_nodes_batch), dtype=torch.long, device=device)
-        r_ids = torch.zeros((B, max_nodes_batch), dtype=torch.long, device=device)
-        cmask = torch.zeros((B, max_nodes_batch), dtype=torch.bool, device=device)
-        
-        L = max_q_len_batch + max_nodes_batch
-        full_am = torch.ones((B, 1, L, L), dtype=torch.bool, device=device)
-        
-        for k, b_data in enumerate(buffer):
-            q_len = b_data['q_len']
-            N = b_data['N']
-            
-            input_ids[k, :q_len] = b_data['q_input'][0]
-            attn_mask[k, :q_len] = b_data['q_attn'][0]
-            
-            if N > 0:
-                p_ids[k, :N] = torch.tensor(b_data['p_ids'], dtype=torch.long)
-                cmask[k, :N] = True
-            
-            # Subgraph Attention Masking logic
-            full_am[k, 0, max_q_len_batch:, max_q_len_batch:] = False
-            if N > 0:
-                full_am[k, 0, max_q_len_batch:max_q_len_batch+N, max_q_len_batch:max_q_len_batch+N] = b_data['am'].to(device)
-            # Block interactions with padding
-            if q_len < max_q_len_batch:
-                full_am[k, 0, q_len:max_q_len_batch, :] = False
-                full_am[k, 0, :, q_len:max_q_len_batch] = False
-            if N < max_nodes_batch:
-                full_am[k, 0, max_q_len_batch+N:, :] = False
-                full_am[k, 0, :, max_q_len_batch+N:] = False
-
-        init_carry = carry_init_fn({'input_ids': input_ids}, device)
-        _, out = model(init_carry, {
-            'input_ids': input_ids,
-            'attention_mask': full_am,
-            'puzzle_identifiers': p_ids,
-            'relation_identifiers': r_ids,
-            'candidate_mask': cmask,
-        })
-        
-        logits = out['scores']
-        probs = torch.sigmoid(logits).cpu().numpy()
-        
-        for k, b_data in enumerate(buffer):
-            N = b_data['N']
-            nodes_list = b_data['nodes_list']
-            gold = b_data['gold']
-            
-            if N == 0:
-                continue
-                
-            p_b = probs[k, :N]
-            pred_nodes = []
-            for i, p in enumerate(p_b):
-                if p > 0.5:
-                    pred_nodes.append(nodes_list[i])
-                    
-            if not pred_nodes and N > 0:
-                top_i = int(np.argmax(p_b))
-                pred_nodes = [nodes_list[top_i]]
-                
-            pred_set = set(pred_nodes)
-            
-            if gold:
-                top_i = int(np.argmax(p_b))
-                pred = nodes_list[top_i]
-                h = 1.0 if pred in gold else 0.0
-                hit1.append(h)
-                
-                inter = len(pred_set & gold)
-                if inter == 0:
-                    f1s.append(0.0)
-                else:
-                    precision = inter / max(1, len(pred_set))
-                    recall = inter / max(1, len(gold))
-                    f1s.append((2.0 * precision * recall) / max(1e-12, precision + recall))
-
-            # Debugging info logic omitted for brevity in batched loop, keeping simple.
-        
-        buffer.clear()
-
-    for ex_idx in tqdm(range(total), desc='Eval'):
+    for eval_pos in tqdm(range(total), desc='Eval'):
+        ex_idx = int(eval_indices[eval_pos])
         ex = data[ex_idx]
         tuples, starts_raw, gold = _parse_eval_example(ex, kb2idx, rel2idx)
         adj = build_adj_from_tuples(tuples)
         starts = list(dict.fromkeys(starts_raw))[:max(1, start_topk)]
-        if not starts or not tuples or not gold:
+        if not starts or not tuples:
+            skip += 1
+            continue
+        if not gold:
             skip += 1
             continue
 
         qi = int(ex_idx)
+        if qi < 0 or qi >= int(q_mem.shape[0]):
+            raise RuntimeError(
+                f"query eval index out of range: ex_idx={qi}, q_mem_rows={int(q_mem.shape[0])}, "
+                f"eval_json={eval_json}, q_npy={q_npy}"
+            )
         q_emb = np.asarray(q_mem[qi], dtype=np.float32)
 
         q_toks = tok(ex.get('question', ''), return_tensors='pt', truncation=True, max_length=max_q_len)
-        
-        nodes = set()
-        for s, _, o in tuples:
-            nodes.add(int(s))
-            nodes.add(int(o))
-            
-        nodes_list = list(nodes)
-        max_nodes_per_graph = 500
-        if len(nodes_list) > max_nodes_per_graph:
-            important = set()
-            important.update(gold.intersection(nodes_list))
-            important.update(set(starts).intersection(nodes_list))
-            import random
-            rem = max_nodes_per_graph - len(important)
-            other = [n for n in nodes_list if n not in important]
-            if rem > 0:
-                important.update(random.sample(other, min(rem, len(other))))
-            nodes_list = list(important)
-            
-        N = len(nodes_list)
-        if N == 0:
+        q_toks = {k: v.to(device) for k, v in q_toks.items()}
+
+        beams = []
+        for s in starts:
+            init_carry = carry_init_fn({'input_ids': q_toks['input_ids']}, device)
+            beams.append(
+                {
+                    'score': 0.0,
+                    'nodes': [int(s)],
+                    'rels': [],
+                    'carry': init_carry,
+                    'q_emb': np.asarray(q_emb, dtype=np.float32).copy(),
+                    'stopped': False,
+                }
+            )
+
+        beams = beams[:max(1, beam)]
+
+        for _ in range(max_steps):
+            new_beams = []
+            for b in beams:
+                if bool(b.get('stopped', False)):
+                    new_beams.append(b)
+                    continue
+                cur = int(b['nodes'][-1])
+                cand = adj.get(cur, [])
+                if not cand:
+                    nb = dict(b)
+                    nb['stopped'] = True
+                    new_beams.append(nb)
+                    continue
+                if no_cycle:
+                    cand = [(r, nxt) for r, nxt in cand if int(nxt) not in b['nodes']]
+                    if not cand:
+                        nb = dict(b)
+                        nb['stopped'] = True
+                        new_beams.append(nb)
+                        continue
+
+                rel_to_nodes = _build_rel_to_nodes(cand)
+                rel_cands = list(rel_to_nodes.keys())
+                if not rel_cands:
+                    nb = dict(b)
+                    nb['stopped'] = True
+                    new_beams.append(nb)
+                    continue
+                rel_cands = _select_rel_candidates(
+                    rel_to_nodes=rel_to_nodes,
+                    q_emb=np.asarray(b.get('q_emb', q_emb), dtype=np.float32),
+                    rel_mem=rel_mem,
+                    max_relations=int(max_neighbors),
+                    prune_keep=int(prune_keep),
+                    prune_rand=0,
+                )
+                if not rel_cands:
+                    nb = dict(b)
+                    nb['stopped'] = True
+                    new_beams.append(nb)
+                    continue
+
+                cur_pid = _safe_entity_id(cur)
+                p_ids = torch.full((1, len(rel_cands)), cur_pid, dtype=torch.long, device=device)
+                r_ids = torch.tensor([rel_cands], dtype=torch.long, device=device)
+                c_mask = torch.ones_like(r_ids, dtype=torch.bool)
+                inp = {
+                    'input_ids': q_toks['input_ids'],
+                    'attention_mask': q_toks['attention_mask'],
+                    'puzzle_identifiers': p_ids,
+                    'relation_identifiers': r_ids,
+                    'candidate_mask': c_mask,
+                }
+
+                next_carry, out = model(b['carry'], inp)
+                logp = torch.log_softmax(out['scores'][0], dim=0)
+                log_continue = 0.0
+                if bool(eval_use_halt) and len(b['rels']) >= min_hops_before_stop:
+                    halt_pair = torch.stack(
+                        [out['q_continue_logits'][0], out['q_halt_logits'][0]], dim=0
+                    )
+                    halt_logp = torch.log_softmax(halt_pair, dim=0)
+                    log_continue = float(halt_logp[0].item())
+                    log_halt = float(halt_logp[1].item())
+                    new_beams.append({
+                        'score': float(b['score'] + log_halt),
+                        'nodes': list(b['nodes']),
+                        'rels': list(b['rels']),
+                        'carry': _clone_carry(next_carry),
+                        'q_emb': np.asarray(b.get('q_emb', q_emb), dtype=np.float32).copy(),
+                        'stopped': True,
+                    })
+                topk = min(max(1, beam), len(rel_cands))
+                topv, topi = torch.topk(logp, k=topk)
+                for v, i in zip(topv.tolist(), topi.tolist()):
+                    r_sel = int(rel_cands[int(i)])
+                    q_next = _apply_query_residual_np(
+                        q_emb=np.asarray(b.get('q_emb', q_emb), dtype=np.float32),
+                        rel_id=r_sel,
+                        rel_mem=rel_mem,
+                        enabled=bool(query_residual_enabled),
+                        alpha=float(query_residual_alpha),
+                        mode=str(query_residual_mode),
+                    )
+                    next_nodes = rel_to_nodes.get(r_sel, [])
+                    if not next_nodes:
+                        if no_cycle:
+                            continue
+                        new_beams.append({
+                            'score': float(b['score'] + log_continue + v),
+                            'nodes': list(b['nodes']),
+                            'rels': list(b['rels']) + [r_sel],
+                            'carry': _clone_carry(next_carry),
+                            'q_emb': np.asarray(q_next, dtype=np.float32).copy(),
+                            'stopped': False,
+                        })
+                    else:
+                        for nxt in next_nodes:
+                            new_beams.append({
+                                'score': float(b['score'] + log_continue + v),
+                                'nodes': list(b['nodes']) + [int(nxt)],
+                                'rels': list(b['rels']) + [r_sel],
+                                'carry': _clone_carry(next_carry),
+                                'q_emb': np.asarray(q_next, dtype=np.float32).copy(),
+                                'stopped': False,
+                            })
+
+            new_beams.sort(key=lambda x: x['score'], reverse=True)
+            beams = new_beams[:max(1, beam)]
+            if not beams:
+                break
+            if all(bool(x.get('stopped', False)) for x in beams):
+                break
+
+        if not beams:
             skip += 1
             continue
 
-        node2idx = {n: idx for idx, n in enumerate(nodes_list)}
-        am = torch.eye(N, dtype=torch.bool)
-        for s, _, o in tuples:
-            s, o = int(s), int(o)
-            if s in node2idx and o in node2idx:
-                si = node2idx[s]
-                oi = node2idx[o]
-                am[si, oi] = True
-                am[oi, si] = True
-                
-        p_ids = [n if (entity_vocab_size is None or n < entity_vocab_size) else 0 for n in nodes_list]
-        
-        buffer.append({
-            'q_input': q_toks['input_ids'],
-            'q_attn': q_toks['attention_mask'],
-            'q_len': q_toks['input_ids'].shape[1],
-            'N': N,
-            'p_ids': p_ids,
-            'am': am,
-            'nodes_list': nodes_list,
-            'gold': gold,
-            'ex': ex
-        })
-        
-        if len(buffer) >= batch_size:
-            _flush_buffer()
-            
-    # Flush remaining instances
-    if len(buffer) > 0:
-        _flush_buffer()
+        best = beams[0]
+        pred = int(best['nodes'][-1])
+        pred_entities = _top_pred_entities(beams, pred_topk)
+        pred_set = set(pred_entities)
+        gold_path = None
+        if gold:
+            h = 1.0 if pred in gold else 0.0
+            hit1.append(h)
+            inter = len(pred_set & gold)
+            if inter == 0:
+                f1_i = 0.0
+                f1s.append(f1_i)
+            else:
+                precision = inter / max(1, len(pred_set))
+                recall = inter / max(1, len(gold))
+                f1_i = (2.0 * precision * recall) / max(1e-12, precision + recall)
+                f1s.append(f1_i)
+            if dump_fp is not None or debugged < max(0, debug_n):
+                gold_path = _find_gold_path(adj, starts_raw, gold, max_steps=max_steps)
+            if dump_fp is not None:
+                rec = {
+                    "index": int(ex_idx),
+                    "question": ex.get("question", ""),
+                    "hit1": float(h),
+                    "f1": float(f1_i),
+                    "pred_entity": int(pred),
+                    "pred_top_entities": [int(x) for x in pred_entities],
+                    "pred_path_nodes": [int(x) for x in best.get("nodes", [])],
+                    "pred_path_relations": [int(x) for x in best.get("rels", [])],
+                    "pred_path_hops": int(len(best.get("rels", []))),
+                    "gold_entities": sorted(int(x) for x in gold),
+                    "num_gold": int(len(gold)),
+                    "gold_path_hops_within_max_steps": (
+                        int(len(gold_path.get("rels", []))) if gold_path is not None else None
+                    ),
+                    "gold_reachable_within_max_steps": bool(gold_path is not None),
+                    "first_pred_relation": (
+                        int(best.get("rels", [])[0]) if len(best.get("rels", [])) > 0 else None
+                    ),
+                    "first_pred_relation_text": (
+                        _idx_to_label(relation_labels, best.get("rels", [])[0])
+                        if relation_labels and len(best.get("rels", [])) > 0
+                        else None
+                    ),
+                    "pred_entity_text": (
+                        _idx_to_label(entity_labels, pred) if entity_labels else str(pred)
+                    ),
+                }
+                dump_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+        if debugged < max(0, debug_n):
+            debugged += 1
+            rel_path = ' -> '.join(str(x) for x in best['rels'])
+            node_path = ' -> '.join(str(x) for x in best['nodes'])
+            print(f"[EvalQ] {ex.get('question', '')}")
+            print(f"  relation_path: {rel_path}")
+            print(f"  node_path: {node_path}")
+            if relation_labels:
+                rel_text_path = ' -> '.join(_idx_to_label(relation_labels, x) for x in best['rels'])
+                print(f"  relation_text_path: {rel_text_path}")
+            if entity_labels:
+                node_text_path = ' -> '.join(_idx_to_label(entity_labels, x) for x in best['nodes'])
+                print(f"  node_text_path: {node_text_path}")
+            print(f"  pred_entity: {pred} | gold_n={len(gold)}")
+            print(f"  pred_top{pred_topk}_entities: {pred_entities}")
+            if entity_labels:
+                pred_top_txt = ' | '.join(_idx_to_label(entity_labels, x) for x in pred_entities)
+                print(f"  pred_top{pred_topk}_text: {pred_top_txt}")
+            if gold_path is None:
+                gold_path = _find_gold_path(adj, starts_raw, gold, max_steps=max_steps)
+            if gold_path is None:
+                print("  gold_path: <not found within max_steps>")
+            else:
+                g_rels = ' -> '.join(str(x) for x in gold_path["rels"])
+                g_nodes = ' -> '.join(str(x) for x in gold_path["nodes"])
+                print(f"  gold_relation_path: {g_rels}")
+                print(f"  gold_node_path: {g_nodes}")
+                if relation_labels:
+                    g_rel_txt = ' -> '.join(_idx_to_label(relation_labels, x) for x in gold_path["rels"])
+                    print(f"  gold_relation_text_path: {g_rel_txt}")
+                if entity_labels:
+                    g_node_txt = ' -> '.join(_idx_to_label(entity_labels, x) for x in gold_path["nodes"])
+                    print(f"  gold_node_text_path: {g_node_txt}")
+
+    if dump_fp is not None:
+        dump_fp.close()
     m_hit = float(np.mean(hit1)) if hit1 else 0.0
     m_f1 = float(np.mean(f1s)) if f1s else 0.0
     return m_hit, m_f1, skip
@@ -945,7 +1171,39 @@ def evaluate_relation_beam(
 def train(args):
     is_ddp, rank, local_rank, world_size, device = _setup_ddp()
     is_main = rank == 0
+    base_seed = int(getattr(args, "seed", 42))
+    det = bool(getattr(args, "deterministic", False))
+    seed_this_rank = int(base_seed + rank)
+    _set_global_seed(seed_this_rank, deterministic=det)
+    if is_main:
+        print(
+            f"[Reproducibility] seed={base_seed} per_rank_seed=seed+rank deterministic={det}"
+        )
     wb = _setup_wandb(args, is_main)
+    subgraph_reader_enabled = str(getattr(args, "subgraph_reader_enabled", False)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if subgraph_reader_enabled:
+        from .subgraph_reader import train_subgraph_reader
+
+        train_subgraph_reader(
+            args,
+            is_ddp=is_ddp,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            device=device,
+            wb=wb,
+        )
+        if is_ddp:
+            dist.destroy_process_group()
+        if wb is not None:
+            wb.finish()
+        return
 
     # Full-dev evaluation on rank0 while other DDP ranks wait at barrier can
     # hit process-group timeout when eval_limit=-1 and timeout is too small.
@@ -966,11 +1224,24 @@ def train(args):
     tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
+    preloaded_sd = None
+    ckpt_vocab_size = None
+    if args.ckpt and os.path.exists(args.ckpt):
+        preloaded_sd = torch.load(args.ckpt, map_location='cpu')
+        ckpt_vocab_size = _infer_vocab_size_from_state_dict(preloaded_sd)
+    vocab_size = int(tok.vocab_size)
+    if ckpt_vocab_size is not None and int(ckpt_vocab_size) > 0 and int(ckpt_vocab_size) != int(vocab_size):
+        if is_main:
+            print(
+                f"[warn] tokenizer vocab_size({vocab_size}) != ckpt vocab_size({int(ckpt_vocab_size)}); "
+                "using ckpt vocab_size for model build."
+            )
+        vocab_size = int(ckpt_vocab_size)
 
     cfg = {
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
-        'vocab_size': tok.vocab_size,
+        'vocab_size': vocab_size,
         'hidden_size': args.hidden_size,
         'num_heads': args.num_heads,
         'expansion': args.expansion,
@@ -998,9 +1269,8 @@ def train(args):
         for p in model.inner.lm_head.parameters():
             p.requires_grad = False
 
-    if args.ckpt and os.path.exists(args.ckpt):
-        sd = torch.load(args.ckpt, map_location='cpu')
-        model.load_state_dict(sd, strict=False)
+    if preloaded_sd is not None:
+        model.load_state_dict(preloaded_sd, strict=False)
 
     model.to(device)
     if is_ddp:
@@ -1066,7 +1336,16 @@ def train(args):
             wb.finish()
         return
 
-    ds = PathDataset(args.train_json, args.max_steps)
+    train_min_path_hops = max(1, int(getattr(args, 'train_min_path_hops', 1)))
+    ds = PathDataset(args.train_json, args.max_steps, min_path_hops=train_min_path_hops)
+    if len(ds) <= 0:
+        raise RuntimeError(
+            f"Empty supervised dataset after flattening paths: train_json={args.train_json}, "
+            f"max_steps={int(args.max_steps)}, train_min_path_hops={int(train_min_path_hops)}. "
+            "Lower train_min_path_hops, increase max_steps, or rebuild preprocessing with richer valid_paths."
+        )
+    if is_main and train_min_path_hops > 1:
+        print(f"[TrainData] min_path_hops={train_min_path_hops} (short paths are skipped in supervised dataset)")
 
     def _parse_optional_float(v):
         if v is None:
@@ -1149,6 +1428,9 @@ def train(args):
     query_residual_enabled = _as_bool(getattr(args, 'query_residual_enabled', False))
     query_residual_alpha = float(getattr(args, 'query_residual_alpha', 0.0))
     query_residual_mode = str(getattr(args, 'query_residual_mode', 'sub_rel')).strip().lower()
+    eval_random_sample_size = int(getattr(args, 'eval_random_sample_size', 0))
+    eval_random_seed = int(getattr(args, 'eval_random_seed', 42))
+    eval_random_resample_each_eval = _as_bool(getattr(args, 'eval_random_resample_each_eval', False))
     if train_sanity_eval_every_pct < 0:
         train_sanity_eval_every_pct = 0
     if train_sanity_eval_limit < 0:
@@ -1188,6 +1470,11 @@ def train(args):
     )
     sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=(sampler is None), sampler=sampler, num_workers=args.num_workers, drop_last=True, collate_fn=collate, pin_memory=torch.cuda.is_available(), persistent_workers=(args.num_workers > 0))
+    if len(loader) <= 0:
+        raise RuntimeError(
+            f"Empty training loader: dataset_size={len(ds)}, batch_size={int(args.batch_size)}, drop_last=True. "
+            "Reduce batch_size or adjust train_min_path_hops/preprocessing."
+        )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable_params, lr=args.lr)
@@ -1556,66 +1843,108 @@ def train(args):
                     avg_adv = 0.0
             else:
                 carry = carry_init_fn({'input_ids': input_ids}, device)
-                
-                # We only have 1 step in sequence batches now for Subgraph Reader
-                step = batch['seq_batches'][0]
-                p_ids = step['puzzle_identifiers'].to(device)
-                r_ids = step['relation_identifiers'].to(device)
-                c_mask = step['candidate_mask'].to(device)
-                labels = step['labels'].to(device)
-                attn_mask = step.get('attention_mask', None)
-                if attn_mask is not None:
-                    attn_mask = attn_mask.to(device)
-                else:
-                    attn_mask = attn
-                
-                carry, out = model(carry, {
-                    'input_ids': input_ids, 
-                    'attention_mask': attn_mask, 
-                    'puzzle_identifiers': p_ids, 
-                    'relation_identifiers': r_ids, 
-                    'candidate_mask': c_mask
-                })
-                
-                logits = out['scores'].masked_fill(~c_mask, -1e4) # [B, N]
-                
-                # BCE Loss for global node classification
-                ev = bce_endpoint(logits, labels).masked_fill(~c_mask, 0.0)
-                ev = ev.sum(dim=1) / c_mask.sum(dim=1).clamp(min=1).float()
-                
-                bl = ev.sum() / max(1, input_ids.shape[0])
-                
-                with torch.no_grad():
-                    # Calculate proxy metrics
-                    probs = torch.sigmoid(logits).masked_fill(~c_mask, 0.0)
-                    for b_idx in range(input_ids.shape[0]):
-                        c_b = c_mask[b_idx]
-                        if c_b.sum() == 0: continue
-                        
-                        pred_nodes = (probs[b_idx] > 0.5) & c_b
-                        gold_nodes = (labels[b_idx] > 0.5) & c_b
-                        
-                        inter = (pred_nodes & gold_nodes).sum().item()
-                        pred_cnt = pred_nodes.sum().item()
-                        gold_cnt = gold_nodes.sum().item()
-                        
-                        if gold_cnt > 0:
-                            prec = inter / max(1, pred_cnt)
-                            rec = inter / gold_cnt
-                            f1 = (2 * prec * rec) / max(1e-12, prec + rec)
-                            
-                            # Hit@1 is whether the max prob node is in gold
-                            max_idx = torch.argmax(probs[b_idx].masked_fill(~c_b, -1.0)).item()
-                            hit1 = 1.0 if gold_nodes[max_idx] else 0.0
-                            
-                            tot_metric_sum += hit1
-                            tot_metric_f1_sum += f1
-                            tot_metric_count += 1
-                            
-                        # Also count how many individual nodes were classified correctly for rel_acc proxy
-                        correct = (pred_nodes == gold_nodes) & c_b
-                        tot_rel_correct += correct.sum().item()
-                        tot_rel_count += c_b.sum().item()
+                T = len(batch['seq_batches'])
+                need_endpoint_proxy_metric = (epoch_acc_mode == 'endpoint_proxy')
+                entity_step_cache = []
+                for t, step in enumerate(batch['seq_batches']):
+                    p_ids = step['puzzle_identifiers'].to(device)
+                    r_ids = step['relation_identifiers'].to(device)
+                    c_mask = step['candidate_mask'].to(device)
+                    endpoint_t = step['endpoint_targets'].to(device)
+                    policy_t = step['policy_targets'].to(device)
+                    halt_t = step['halt_targets'].to(device)
+                    halt_m = step['halt_mask'].to(device)
+                    labels = step['labels'].to(device)
+                    v_mask = step['valid_mask'].to(device)
+                    carry, out = model(carry, {'input_ids': input_ids, 'attention_mask': attn, 'puzzle_identifiers': p_ids, 'relation_identifiers': r_ids, 'candidate_mask': c_mask})
+                    logits = out['scores'].masked_fill(~c_mask, -1e4)
+                    if cur_entity_dist_main_mode or need_endpoint_proxy_metric:
+                        probs = torch.softmax(logits, dim=1)
+                        entity_step_cache.append(
+                            {
+                                'probs': probs,
+                                'r_ids': r_ids,
+                                'c_mask': c_mask,
+                                'v_mask': v_mask,
+                            }
+                        )
+                    lv = ce(logits, labels).masked_fill(~v_mask, 0.0)
+                    valid = v_mask & (labels >= 0)
+                    if valid.any():
+                        pred = torch.argmax(logits, dim=1)
+                        tot_rel_correct += int((pred[valid] == labels[valid]).sum().item())
+                        tot_rel_count += int(valid.sum().item())
+                    sc = v_mask.sum().clamp(min=1)
+                    ce_loss = lv.sum() / sc
+                    endpoint_loss = torch.zeros((), device=device)
+                    if cur_endpoint_enabled:
+                        ev = bce_endpoint(logits, endpoint_t).masked_fill(~c_mask, 0.0)
+                        ev = ev.sum(dim=1) / c_mask.sum(dim=1).clamp(min=1).float()
+                        ev = ev.masked_fill(~v_mask, 0.0)
+                        endpoint_loss = ev.sum() / sc
+                    policy_loss = torch.zeros((), device=device)
+                    if cur_metric_align_enabled:
+                        # Align train target with final answer reachability:
+                        # maximize probability mass on relations that reduce shortest distance to gold.
+                        logp = torch.log_softmax(logits, dim=1)
+                        pos_mass = (torch.exp(logp) * policy_t).sum(dim=1)
+                        policy_valid = v_mask & (policy_t.sum(dim=1) > 0.0)
+                        pv = (-torch.log(pos_mass.clamp(min=1e-8))).masked_fill(~policy_valid, 0.0)
+                        policy_sc = policy_valid.sum().clamp(min=1).float()
+                        policy_loss = pv.sum() / policy_sc
+
+                    if cur_metric_align_main_mode:
+                        step_loss = policy_loss
+                        if cur_relation_aux_weight > 0.0:
+                            step_loss = step_loss + cur_relation_aux_weight * ce_loss
+                    elif cur_entity_dist_main_mode:
+                        step_loss = torch.zeros((), device=device)
+                        if cur_relation_aux_weight > 0.0:
+                            step_loss = step_loss + cur_relation_aux_weight * ce_loss
+                    elif cur_endpoint_main_mode:
+                        step_loss = endpoint_loss
+                        if cur_relation_aux_weight > 0.0:
+                            step_loss = step_loss + cur_relation_aux_weight * ce_loss
+                    else:
+                        step_loss = ce_loss
+                    if (not cur_endpoint_main_mode) and cur_endpoint_aux_weight > 0.0:
+                        step_loss = step_loss + cur_endpoint_aux_weight * endpoint_loss
+                    if (not cur_metric_align_main_mode) and cur_metric_align_aux_weight > 0.0:
+                        step_loss = step_loss + cur_metric_align_aux_weight * policy_loss
+                    if cur_halt_aux_weight > 0.0:
+                        halt_pair = torch.stack(
+                            [out['q_continue_logits'].to(torch.float32), out['q_halt_logits'].to(torch.float32)],
+                            dim=1,
+                        )
+                        halt_labels = halt_t.to(torch.long)
+                        halt_vec = ce_halt(halt_pair, halt_labels).masked_fill(~halt_m, 0.0)
+                        halt_l = halt_vec.sum() / halt_m.sum().clamp(min=1).float()
+                        step_loss = step_loss + cur_halt_aux_weight * halt_l
+                    bl += ((t + 1) / T) * step_loss
+                if need_endpoint_proxy_metric and entity_step_cache:
+                    with torch.no_grad():
+                        _, proxy_hit_sum, proxy_f1_sum, proxy_n = _entity_dist_loss_from_steps(
+                            step_cache=entity_step_cache,
+                            tuples_list=batch['rl_tuples'],
+                            starts_list=batch['rl_start_nodes'],
+                            golds_list=batch['rl_gold_answers'],
+                            compute_loss=False,
+                            return_stats=True,
+                        )
+                    if proxy_n > 0:
+                        tot_metric_sum += float(proxy_hit_sum)
+                        tot_metric_f1_sum += float(proxy_f1_sum)
+                        tot_metric_count += int(proxy_n)
+                if cur_entity_dist_main_mode:
+                    entity_dist_loss = _entity_dist_loss_from_steps(
+                        step_cache=entity_step_cache,
+                        tuples_list=batch['rl_tuples'],
+                        starts_list=batch['rl_start_nodes'],
+                        golds_list=batch['rl_gold_answers'],
+                        compute_loss=True,
+                        return_stats=False,
+                    )
+                    bl = bl + entity_dist_loss
             if not torch.isfinite(bl):
                 if is_ddp:
                     raise RuntimeError('non-finite loss in DDP')
@@ -1715,6 +2044,8 @@ def train(args):
                         query_residual_mode=str(query_residual_mode),
                         entity_labels=None,
                         relation_labels=None,
+                        eval_random_sample_size=0,
+                        eval_random_seed=42,
                     )
                     print(
                         f"[TrainSanity] ep={ep} step={steps}/{len(loader)} "
@@ -1809,6 +2140,10 @@ def train(args):
                     query_residual_mode=str(query_residual_mode),
                     entity_labels=entity_labels,
                     relation_labels=relation_labels,
+                    eval_random_sample_size=int(eval_random_sample_size),
+                    eval_random_seed=int(
+                        eval_random_seed + (ep if eval_random_resample_each_eval else 0)
+                    ),
                 )
                 print(f'[Dev] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')
                 dev_hit1 = float(mh)
@@ -1920,11 +2255,33 @@ def train(args):
 
 
 def test(args):
+    subgraph_reader_enabled = str(getattr(args, "subgraph_reader_enabled", False)).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if subgraph_reader_enabled:
+        from .subgraph_reader import test_subgraph_reader
+
+        test_subgraph_reader(args)
+        return
+
     # Full relation-path beam traversal evaluation:
     # start-entity -> predicted end-entity, measured by Hit@1/F1.
     tok = load_tokenizer(args.trm_tokenizer)
     ent_mem = np.load(args.entity_emb_npy, mmap_mode='r')
     rel_mem = np.load(args.relation_emb_npy, mmap_mode='r')
+    sd = torch.load(args.ckpt, map_location='cpu')
+    ckpt_vocab_size = _infer_vocab_size_from_state_dict(sd)
+    vocab_size = int(tok.vocab_size)
+    if ckpt_vocab_size is not None and int(ckpt_vocab_size) > 0 and int(ckpt_vocab_size) != int(vocab_size):
+        print(
+            f"[warn] tokenizer vocab_size({vocab_size}) != ckpt vocab_size({int(ckpt_vocab_size)}); "
+            "using ckpt vocab_size for model build."
+        )
+        vocab_size = int(ckpt_vocab_size)
     kb2idx = load_kb_map(args.entities_txt)
     rel2idx = load_rel_map(args.relations_txt)
     entity_labels = _load_entity_labels(args.entities_txt, getattr(args, 'entity_names_json', ''))
@@ -1932,7 +2289,7 @@ def test(args):
     cfg = {
         'batch_size': args.batch_size,
         'seq_len': args.seq_len,
-        'vocab_size': tok.vocab_size,
+        'vocab_size': vocab_size,
         'hidden_size': args.hidden_size,
         'num_heads': args.num_heads,
         'expansion': args.expansion,
@@ -1955,7 +2312,6 @@ def test(args):
     model, _ = build_model(args.model_impl, args.trm_root, cfg)
     model.inner.puzzle_emb_data = ent_mem
     model.inner.relation_emb_data = rel_mem
-    sd = torch.load(args.ckpt, map_location='cpu')
     model.load_state_dict(sd, strict=False)
     model.to(torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
     dev = next(model.parameters()).device
@@ -1996,5 +2352,8 @@ def test(args):
             query_residual_mode=str(getattr(args, 'query_residual_mode', 'sub_rel')),
             entity_labels=entity_labels,
             relation_labels=relation_labels,
+            eval_dump_jsonl=str(getattr(args, 'eval_dump_jsonl', '')),
+            eval_random_sample_size=int(getattr(args, 'eval_random_sample_size', 0)),
+            eval_random_seed=int(getattr(args, 'eval_random_seed', 42)),
         )
         print(f'[Test] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')

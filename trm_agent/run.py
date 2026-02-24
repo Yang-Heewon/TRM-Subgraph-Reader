@@ -4,10 +4,6 @@ Usage:
   python -m trm_agent.run --dataset cwq --stage preprocess
 """
 
-import os
-if os.name == 'nt':
-    os.environ["USE_LIBUV"] = "0"
-
 from trm_rag_style.run import main
 
 
