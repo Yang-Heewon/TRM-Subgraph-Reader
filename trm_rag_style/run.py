@@ -85,9 +85,15 @@ def enrich_paths(cfg):
         if os.path.exists(legacy_ckpt):
             cfg['ckpt_dir'] = legacy_ckpt
 
-    cfg['train_jsonl'] = os.path.join(cfg['processed_dir'], 'train.jsonl')
-    cfg['dev_jsonl'] = os.path.join(cfg['processed_dir'], 'dev.jsonl')
-    cfg['test_jsonl'] = os.path.join(cfg['processed_dir'], 'test.jsonl')
+    if cfg['dataset'] == 'cwq':
+        cfg['train_jsonl'] = os.path.join(cfg['workspace_root'], 'data', 'CWQ', 'train_split.jsonl')
+        cfg['dev_jsonl'] = os.path.join(cfg['workspace_root'], 'data', 'CWQ', 'dev_split.jsonl')
+        cfg['test_jsonl'] = os.path.join(cfg['workspace_root'], 'data', 'CWQ', 'test_split.jsonl')
+    else:
+        cfg['train_jsonl'] = os.path.join(cfg['workspace_root'], 'data', cfg['dataset'], 'train.json')
+        cfg['dev_jsonl'] = os.path.join(cfg['workspace_root'], 'data', cfg['dataset'], 'dev.json')
+        cfg['test_jsonl'] = os.path.join(cfg['workspace_root'], 'data', cfg['dataset'], 'test.json')
+
     cfg['train_json'] = cfg['train_jsonl']
     cfg['dev_json'] = cfg['dev_jsonl']
     cfg['eval_json'] = cfg['test_jsonl'] if os.path.exists(cfg['test_jsonl']) else cfg['dev_jsonl']

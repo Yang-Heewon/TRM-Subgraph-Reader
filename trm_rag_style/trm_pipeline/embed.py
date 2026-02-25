@@ -21,5 +21,5 @@ def run(cfg):
         passage_prefix=str(cfg.get('embed_passage_prefix', '')),
         save_lists=bool(cfg.get('embed_save_lists', True)),
     )
-    print('✅ embed done:', meta)
+    print('[done] embed done:', meta)
     return meta

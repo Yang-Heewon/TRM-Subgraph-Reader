@@ -9,6 +9,7 @@ __pycache__/
 *.npy
 processed/
 ckpt/
+checkpoints/
 emb/
 data/webqsp/
 data/*_split.jsonl

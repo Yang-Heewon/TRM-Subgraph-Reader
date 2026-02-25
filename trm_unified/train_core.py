@@ -1,6 +1,7 @@
 import importlib
 import math
 import os
+import sys
 import re
 import json
 from datetime import timedelta
@@ -17,8 +18,15 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from .data import build_adj_from_tuples, iter_json_records, load_kb_map, load_rel_map, read_jsonl_by_offset, build_line_offsets
-from .tokenization import load_tokenizer
+import sys
+import os
+
+# Ensure the parent directory is in sys.path so that relative imports work
+# when this file is executed directly as a script.
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from trm_unified.data import build_adj_from_tuples, iter_json_records, load_kb_map, load_rel_map, read_jsonl_by_offset, build_line_offsets
+from trm_unified.tokenization import load_tokenizer
 
 
 def _setup_wandb(args, is_main: bool):
@@ -161,14 +169,17 @@ def _apply_query_residual_np(
 
 
 class PathDataset(Dataset):
-    def __init__(self, jsonl_path: str, max_steps: int):
+    def __init__(self, jsonl_path: str, max_steps: int, max_paths: int = -1):
         self.jsonl_path = jsonl_path
         self.max_steps = max_steps
+        self.max_paths = max_paths
         self.offsets = build_line_offsets(jsonl_path, is_main=True)
         self.flat = []
         for i in tqdm(range(len(self.offsets)), desc='Flattening'):
             ex = read_jsonl_by_offset(self.jsonl_path, self.offsets, i)
             vps = ex.get('valid_paths', [])
+            if self.max_paths > 0:
+                vps = vps[:self.max_paths]
             for pidx in range(len(vps)):
                 self.flat.append((i, pidx))
 
@@ -201,40 +212,18 @@ class PathDataset(Dataset):
         }
 
 
-def make_collate(
-    tokenizer_name,
-    rel_npy,
-    q_npy,
-    max_neighbors,
-    prune_keep,
-    prune_rand,
-    max_q_len,
-    max_steps,
-    endpoint_aux=False,
-    entity_vocab_size: Optional[int] = None,
-    query_residual_enabled: bool = False,
-    query_residual_alpha: float = 0.0,
-    query_residual_mode: str = "sub_rel",
-):
-    tok = load_tokenizer(tokenizer_name)
-    rel_mem = np.load(rel_npy, mmap_mode='r')
-    if not q_npy:
-        raise RuntimeError("query embedding path is empty for training collate (q_npy).")
-    if not os.path.exists(q_npy):
-        raise FileNotFoundError(
-            f"query embedding file not found for training: {q_npy}. "
-            "Run embed stage first and ensure query_train.npy exists."
-        )
-    q_mem = np.load(q_npy, mmap_mode='r')
-    if int(q_mem.shape[1]) != int(rel_mem.shape[1]):
-        raise RuntimeError(
-            f"embedding dim mismatch (train): query_dim={int(q_mem.shape[1])}, "
-            f"relation_dim={int(rel_mem.shape[1])}. "
-            "Rebuild query/relation embeddings with the same embedding model/style."
-        )
+class TRMCollate:
+    def __init__(self, tokenizer_name, max_q_len, entity_vocab_size):
+        self.tokenizer_name = tokenizer_name
+        self.max_q_len = max_q_len
+        self.entity_vocab_size = entity_vocab_size
+        self.tok = None
 
-    def _fn(batch):
-        toks = tok([b['q_text'] for b in batch], padding=True, truncation=True, max_length=max_q_len, return_tensors='pt')
+    def __call__(self, batch):
+        if self.tok is None:
+            self.tok = load_tokenizer(self.tokenizer_name)
+            
+        toks = self.tok([b['q_text'] for b in batch], padding=True, truncation=True, max_length=self.max_q_len, return_tensors='pt')
         
         B = len(batch)
         max_nodes = 0
@@ -250,7 +239,7 @@ def make_collate(
                 nodes.add(int(o))
             
             nodes_list = list(nodes)
-            max_nodes_per_graph = 500
+            max_nodes_per_graph = 2000
             if len(nodes_list) > max_nodes_per_graph:
                 important = set()
                 important.update(gold_set.intersection(nodes_list))
@@ -280,7 +269,7 @@ def make_collate(
                     am[si, oi] = True
                     am[oi, si] = True
                     
-            p_ids = [n if (entity_vocab_size is None or n < entity_vocab_size) else 0 for n in nodes_list]
+            p_ids = [n if (self.entity_vocab_size is None or n < self.entity_vocab_size) else 0 for n in nodes_list]
             r_ids = [0] * N
             lbls = [1.0 if n in gold_set else 0.0 for n in nodes_list]
             
@@ -360,11 +349,56 @@ def make_collate(
             'rl_q_embs': torch.zeros((B, 1)),
         }
 
-    return _fn
+
+def make_collate(
+    tokenizer_name,
+    rel_npy,
+    q_npy,
+    max_neighbors,
+    prune_keep,
+    prune_rand,
+    max_q_len,
+    max_steps,
+    endpoint_aux=False,
+    entity_vocab_size: Optional[int] = None,
+    query_residual_enabled: bool = False,
+    query_residual_alpha: float = 0.0,
+    query_residual_mode: str = "sub_rel",
+):
+    rel_mem = np.load(rel_npy, mmap_mode='r')
+    if not q_npy:
+        raise RuntimeError("query embedding path is empty for training collate (q_npy).")
+    if not os.path.exists(q_npy):
+        raise FileNotFoundError(
+            f"query embedding file not found for training: {q_npy}. "
+            "Run embed stage first and ensure query_train.npy exists."
+        )
+    q_mem = np.load(q_npy, mmap_mode='r')
+    if int(q_mem.shape[1]) != int(rel_mem.shape[1]):
+        raise RuntimeError(
+            f"embedding dim mismatch (train): query_dim={int(q_mem.shape[1])}, "
+            f"relation_dim={int(rel_mem.shape[1])}. "
+            "Rebuild query/relation embeddings with the same embedding model/style."
+        )
+
+    return TRMCollate(tokenizer_name, max_q_len, entity_vocab_size)
 
 
 def _setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        world_size = int(os.environ['WORLD_SIZE'])
+        
+        # If running a single process, avoid DDP entirely to prevent Windows Gloo/NCCL crashes
+        if world_size <= 1:
+            rank = int(os.environ.get('RANK', 0))
+            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+                device = torch.device(f'cuda:{local_rank}')
+            else:
+                device = torch.device('cpu')
+            return False, rank, local_rank, world_size, device
+            
         timeout_min = int(os.environ.get("DDP_TIMEOUT_MINUTES", "30"))
         timeout_min = max(1, timeout_min)
         
@@ -380,7 +414,6 @@ def _setup_ddp():
         )
         rank = int(os.environ['RANK'])
         local_rank = int(os.environ['LOCAL_RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = torch.device(f'cuda:{local_rank}')
@@ -396,9 +429,11 @@ def build_model(model_impl: str, trm_root: str, cfg: dict):
             f"TRM root not found: {trm_root}. "
             "Set --trm_root or TRM_ROOT to your TinyRecursiveModels path."
         )
-    if trm_root not in os.sys.path:
-        os.sys.path.append(trm_root)
+    if trm_root not in sys.path:
+        sys.path.append(trm_root)
     mod = importlib.import_module(f'models.recursive_reasoning.{model_impl}')
+    
+    # trm_hier6 and trm both export the ACTV1 class wrapper
     cls = getattr(mod, 'TinyRecursiveReasoningModel_ACTV1')
     carry_cls = getattr(mod, 'TinyRecursiveReasoningModel_ACTV1Carry')
     return cls(cfg), carry_cls
@@ -451,23 +486,31 @@ def _parse_eval_example(ex: dict, kb2idx: Dict[str, int], rel2idx: Dict[str, int
                 pass
 
     gold = set()
-    for x in ex.get('answers_cid', []):
-        try:
-            gold.add(int(x))
-        except Exception:
-            pass
-    for a in ex.get('answers', []):
-        if isinstance(a, dict):
-            kb_id = a.get('kb_id')
-            if kb_id in kb2idx:
-                gold.add(int(kb2idx[kb_id]))
-    for a in ex.get('gold_answers', []):
-        if isinstance(a, dict) and 'node_id' in a:
+    
+    # Try getting answers_cid correctly first
+    if 'answers_cid' in ex:
+        for x in ex['answers_cid']:
             try:
-                gold.add(int(a['node_id']))
+                gold.add(int(x))
             except Exception:
                 pass
-
+                
+    # Fallback to mapping answers via kb_id
+    if not gold and 'answers' in ex:
+        for a in ex['answers']:
+            if isinstance(a, dict):
+                kb_id = a.get('kb_id')
+                if kb_id in kb2idx:
+                    gold.add(int(kb2idx[kb_id]))
+                    
+    # Fallback to gold_answers
+    if not gold and 'gold_answers' in ex:
+        for a in ex['gold_answers']:
+            if isinstance(a, dict) and 'node_id' in a:
+                try:
+                    gold.add(int(a['node_id']))
+                except Exception:
+                    pass
     return final_tuples, starts, gold
 
 
@@ -773,7 +816,8 @@ def evaluate_relation_beam(
                 break
         return out
 
-    batch_size = int(getattr(args, 'eval_batch_size', 100)) if 'args' in globals() else 100 # Default to 100 but allow argument override if passed implicitly
+    batch_size = int(getattr(args, 'eval_batch_size', 4)) if 'args' in globals() else 4 # Default to 4 to prevent OOM
+
     
     # We will buffer instances to run in batches
     buffer = []
@@ -868,6 +912,8 @@ def evaluate_relation_beam(
             # Debugging info logic omitted for brevity in batched loop, keeping simple.
         
         buffer.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     for ex_idx in tqdm(range(total), desc='Eval'):
         ex = data[ex_idx]
@@ -889,7 +935,7 @@ def evaluate_relation_beam(
             nodes.add(int(o))
             
         nodes_list = list(nodes)
-        max_nodes_per_graph = 500
+        max_nodes_per_graph = 2000
         if len(nodes_list) > max_nodes_per_graph:
             important = set()
             important.update(gold.intersection(nodes_list))
@@ -1066,7 +1112,7 @@ def train(args):
             wb.finish()
         return
 
-    ds = PathDataset(args.train_json, args.max_steps)
+    ds = PathDataset(args.train_json, args.max_steps, getattr(args, 'max_paths', -1))
 
     def _parse_optional_float(v):
         if v is None:
@@ -1579,11 +1625,28 @@ def train(args):
                 
                 logits = out['scores'].masked_fill(~c_mask, -1e4) # [B, N]
                 
-                # BCE Loss for global node classification
-                ev = bce_endpoint(logits, labels).masked_fill(~c_mask, 0.0)
-                ev = ev.sum(dim=1) / c_mask.sum(dim=1).clamp(min=1).float()
+                # BCE Loss for global node classification with Dynamic Pos Weight
+                ev_losses = []
+                for b_idx in range(input_ids.shape[0]):
+                    c_b = c_mask[b_idx]
+                    if c_b.sum() == 0: continue
+                    
+                    lbls_b = labels[b_idx][c_b]
+                    logits_b = logits[b_idx][c_b]
+                    
+                    num_pos = lbls_b.sum().clamp(min=1)
+                    num_neg = (len(lbls_b) - num_pos).clamp(min=1)
+                    pos_weight = (num_neg / num_pos).to(device)
+                    
+                    loss_b = F.binary_cross_entropy_with_logits(
+                        logits_b, lbls_b, pos_weight=pos_weight, reduction='mean'
+                    )
+                    ev_losses.append(loss_b)
                 
-                bl = ev.sum() / max(1, input_ids.shape[0])
+                if ev_losses:
+                    bl = torch.stack(ev_losses).mean()
+                else:
+                    bl = torch.zeros((), device=device, requires_grad=True)
                 
                 with torch.no_grad():
                     # Calculate proxy metrics
@@ -1776,8 +1839,8 @@ def train(args):
             print(f'Saved {ckpt}')
             dev_hit1 = None
             dev_f1 = None
-            eval_every = max(1, int(getattr(args, 'eval_every_epochs', 1)))
-            eval_start = max(1, int(getattr(args, 'eval_start_epoch', 1)))
+            eval_every = max(1, int(getattr(args, 'eval_every', 1)))
+            eval_start = max(1, int(getattr(args, 'eval_start', 1)))
             should_eval = ep >= eval_start and ((ep - eval_start) % eval_every == 0)
             if getattr(args, 'dev_json', '') and should_eval:
                 # Dev evaluation uses the same endpoint traversal metric as test:
@@ -1967,7 +2030,7 @@ def test(args):
         inner = model.inner
         return carry_cls(inner.empty_carry(B), torch.zeros(B, device=device), torch.ones(B, dtype=torch.bool, device=device), {})
 
-    print('✅ checkpoint loaded:', args.ckpt)
+    print('[done] checkpoint loaded:', args.ckpt)
     if getattr(args, 'eval_json', ''):
         mh, mf, sk = evaluate_relation_beam(
             model=model,
@@ -1998,3 +2061,97 @@ def test(args):
             relation_labels=relation_labels,
         )
         print(f'[Test] Hit@1={mh:.4f} F1={mf:.4f} Skip={sk}')
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_impl', type=str, default='act_v1')
+    parser.add_argument('--trm_root', type=str, default='./')
+    parser.add_argument('--trm_tokenizer', type=str, default='roberta-large')
+    parser.add_argument('--max_q_len', type=int, default=64)
+    parser.add_argument('--train_json', type=str)
+    parser.add_argument('--dev_json', type=str)
+    parser.add_argument('--entities_txt', type=str)
+    parser.add_argument('--relations_txt', type=str)
+    parser.add_argument('--entity_emb_npy', type=str)
+    parser.add_argument('--relation_emb_npy', type=str)
+    parser.add_argument('--hidden_size', type=int, default=512)
+    parser.add_argument('--num_heads', type=int, default=8)
+    parser.add_argument('--expansion', type=int, default=2)
+    parser.add_argument('--H_cycles', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--batch_size', type=int, default=1)
+    parser.add_argument('--eval_batch_size', type=int, default=1)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--max_steps', type=int, default=3)
+    parser.add_argument('--save_dir', type=str, default='checkpoints')
+    parser.add_argument('--out_dir', type=str, default='checkpoints')
+    parser.add_argument('--eval_limit', type=int, default=20)
+    parser.add_argument('--endpoint_loss_mode', type=str, default='endpoint_hit1')
+    
+    # Defaults needed by train() internally
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--endpoint_aux', type=float, default=1.0)
+    parser.add_argument('--relation_aux', type=float, default=0.0)
+    parser.add_argument('--halt_aux', type=float, default=0.0)
+    parser.add_argument('--metric_align_aux', type=float, default=0.0)
+    parser.add_argument('--train_acc_mode', type=str, default='auto')
+    parser.add_argument('--log_every', type=int, default=10)
+    parser.add_argument('--eval_every', type=int, default=1)
+    parser.add_argument('--eval_start', type=int, default=1)
+    parser.add_argument('--rel_npy', type=str, default='')
+    parser.add_argument('--q_npy', type=str, default='')
+    parser.add_argument('--entity_vocab_size', type=int, default=0)
+    parser.add_argument('--query_emb_eval_npy', type=str, default='')
+    parser.add_argument('--query_emb_dev_npy', type=str, default='')
+    parser.add_argument('--query_emb_train_npy', type=str, default='')
+    parser.add_argument('--eval_json', type=str, default='')
+    
+    # Defaults needed by train() internally that the outer wrapper normally provided
+    parser.add_argument('--prune_rand', type=int, default=0)
+    parser.add_argument('--eval_no_cycle', action='store_true')
+    parser.add_argument('--query_residual_enabled', action='store_true')
+    parser.add_argument('--query_residual_alpha', type=float, default=0.0)
+    parser.add_argument('--query_residual_mode', type=str, default='sub_rel')
+    
+    # Testing missing fields to satisfy training loop constraints
+    parser.add_argument('--phase2_start_epoch', type=int, default=-1)
+    parser.add_argument('--phase2_auto_enabled', action='store_true')
+    parser.add_argument('--phase2_endpoint_loss_mode', type=str, default='')
+    parser.add_argument('--phase2_relation_aux', type=float, default=0.0)
+    parser.add_argument('--phase2_endpoint_aux', type=float, default=0.0)
+    parser.add_argument('--phase2_metric_align_aux', type=float, default=0.0)
+    parser.add_argument('--phase2_halt_aux', type=float, default=0.0)
+    parser.add_argument('--lr_warmup_steps', type=int, default=0)
+    parser.add_argument('--weight_decay', type=float, default=0.0)
+    parser.add_argument('--eval_max_steps', type=int, default=3)
+    parser.add_argument('--eval_max_neighbors', type=int, default=256)
+    parser.add_argument('--eval_prune_keep', type=int, default=64)
+    parser.add_argument('--eval_start_topk', type=int, default=5)
+    parser.add_argument('--eval_beam', type=int, default=5)
+    parser.add_argument('--eval_pred_topk', type=int, default=1)
+    parser.add_argument('--seq_len', type=int, default=1)
+    parser.add_argument('--pos_encodings', type=str, default='')
+    parser.add_argument('--forward_dtype', type=str, default='float32')
+    parser.add_argument('--halt_max_steps', type=int, default=0)
+    parser.add_argument('--halt_exploration_prob', type=float, default=0.0)
+    parser.add_argument('--puzzle_emb_len', type=int, default=1)
+    parser.add_argument('--L_cycles', type=int, default=1)
+    parser.add_argument('--L_layers', type=int, default=1)
+    parser.add_argument('--ckpt', type=str, default='')
+    parser.add_argument('--max_neighbors', type=int, default=0)
+    parser.add_argument('--prune_keep', type=int, default=100)
+    parser.add_argument('--max_paths', type=int, default=-1, help='Max valid paths per question')
+    
+    args, unknown = parser.parse_known_args()
+    
+    if args.rel_npy == '': args.rel_npy = args.relation_emb_npy
+    if args.q_npy != '' and args.query_emb_train_npy == '': args.query_emb_train_npy = args.q_npy
+    
+    if getattr(args, 'train_json', ''):
+        train(args)
+    elif getattr(args, 'eval_json', ''):
+        test(args)
+    else:
+        print("No --train_json or --eval_json provided. Exiting.")

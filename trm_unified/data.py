@@ -147,7 +147,7 @@ def build_line_offsets(jsonl_path: str, is_main: bool = True) -> List[int]:
             off = f.tell()
             line = f.readline()
     if is_main:
-        print(f"✅ Indexed {len(offsets)} lines from {jsonl_path}")
+        print(f"[done] Indexed {len(offsets)} lines from {jsonl_path}")
     return offsets
 
 
